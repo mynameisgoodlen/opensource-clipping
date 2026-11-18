@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Paste the YouTube video or stream URL"
+        description: "Paste your YouTube video or stream URL"
         required: true
         type: string
 
@@ -29,18 +29,20 @@ jobs:
       MKL_NUM_THREADS: "4"
 
     steps:
-      - name: Download repository
+      - name: Checkout repository
         uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+
       - name: Install Deno
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-     - name: Install FFmpeg and system libraries
+
+      - name: Install FFmpeg and system libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -49,7 +51,9 @@ jobs:
             libglib2.0-0 \
             libsm6 \
             libxext6
+
           ffmpeg -version
+          deno --version
 
       - name: Install Python dependencies
         run: |
@@ -59,49 +63,65 @@ jobs:
             "numpy==1.26.4" \
             "mediapipe==0.10.21" \
             "opencv-python==4.11.0.86" \
-            yt-dlp \
-            faster-whisper \
-            google-genai \
             Pillow \
             requests \
-            python-dotenv
-      - name: Update yt-dlp and EJS support
+            python-dotenv \
+            faster-whisper \
+            google-genai \
+            tqdm \
+            "yt-dlp[default]"
+
+      - name: Update yt-dlp
         run: |
           python -m pip install --no-cache-dir --upgrade "yt-dlp[default]"
-          deno --version
           yt-dlp --version
+
+      - name: Prepare YouTube authentication
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${YOUTUBE_COOKIES:-}" ]]; then
+            echo "::error::Missing YOUTUBE_COOKIES repository secret."
+            echo "Add your Netscape-format cookies.txt contents as a repository secret."
+            exit 1
+          fi
+
+          printf '%s' "$YOUTUBE_COOKIES" > "$RUNNER_TEMP/youtube_cookies.txt"
+          chmod 600 "$RUNNER_TEMP/youtube_cookies.txt"
 
       - name: Run AI clipping
         env:
           VIDEO_URL: ${{ inputs.video_url }}
           GOOGLE_API_KEY: ${{ inputs.gemini_api_key }}
-          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          if [[ -z "${YOUTUBE_COOKIES:-}" ]]; then
-            echo "::error::Missing YOUTUBE_COOKIES repository secret."
+          if [[ -z "${VIDEO_URL//[[:space:]]/}" ]]; then
+            echo "::error::YouTube URL is missing."
             exit 1
           fi
 
-          printf '%s' "$YOUTUBE_COOKIES" > youtube_cookies.txt
-          chmod 600 youtube_cookies.txt
-          trap 'rm -f youtube_cookies.txt' EXIT
+          if [[ -z "${GOOGLE_API_KEY//[[:space:]]/}" ]]; then
+            echo "::error::Gemini API key is missing."
+            exit 1
+          fi
+
+          echo "::add-mask::$GOOGLE_API_KEY"
 
           mkdir -p outputs
 
           python main.py \
             --url "$VIDEO_URL" \
             --source youtube \
-            --yt-cookies youtube_cookies.txt \
+            --yt-cookies "$RUNNER_TEMP/youtube_cookies.txt" \
             --clips 2 \
             --ratio "3:4" \
             --source-height max \
             --render-height 1080 \
             --ai-provider gemini \
-            --gemini-model "YOUR_EXISTING_GEMINI_MODEL" \
-            --gemini-fallback-model "YOUR_EXISTING_FALLBACK_MODEL" \
             --whisper-model base \
             --whisper-device cpu \
             --whisper-compute-type int8 \
@@ -121,34 +141,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
 
-          clips=(outputs/highlight_rank_*_ready.mp4)
-          count=${#clips[@]}
+          mkdir -p outputs
 
-          echo "Rendered clips: $count"
+          count=$(find outputs -type f -name 'highlight_rank_*_ready.mp4' | wc -l)
 
-          if (( count == 0 )); then
-            echo "ERROR: No final MP4 clips were generated."
-            echo "Files found in outputs:"
-            find outputs -maxdepth 2 -type f -print || true
+          echo "Generated clips: $count"
+
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::No final MP4 clips were generated."
+            find outputs -maxdepth 4 -type f -print || true
             exit 1
           fi
 
-          if (( count != 2 )); then
-            echo "::warning::Expected 2 clips, but found $count."
-          fi
+          find outputs -type f -name 'highlight_rank_*_ready.mp4' -exec ls -lh {} \;
 
-          for clip in "${clips[@]}"; do
-            ls -lh "$clip"
-          done
-
-      - name: Upload final MP4 clips
+      - name: Upload final clips
         if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: final-video-clips
-          path: outputs/highlight_rank_*_ready.mp4
-          if-no-files-found: ignore
+          path: outputs/**/highlight_rank_*_ready.mp4
+          if-no-files-found: warn
           compression-level: 0
           retention-days: 7
+
+      - name: Remove temporary cookies
+        if: ${{ always() }}
+        run: |
+          rm -f "$RUNNER_TEMP/youtube_cookies.txt"
