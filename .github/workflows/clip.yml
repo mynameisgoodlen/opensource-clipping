@@ -126,7 +126,6 @@ jobs:
             --whisper-device cpu \
             --whisper-compute-type int8 \
             --face-detector mediapipe \
-            --use-dlp-subs \
             --no-subs \
             --no-broll \
             --no-bgm \
