@@ -36,7 +36,15 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Update yt-dlp and EJS support
+        run: |
+          python -m pip install --no-cache-dir --upgrade "yt-dlp[default]"
+          deno --version
+          yt-dlp --version
       - name: Install FFmpeg and system libraries
         run: |
           sudo apt-get update
