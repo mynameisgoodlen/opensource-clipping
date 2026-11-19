@@ -1,0 +1,171 @@
+name: AI Stream Clipper - Facecam + Gameplay
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Paste your YouTube video or completed livestream URL"
+        required: true
+        type: string
+      gemini_api_key:
+        description: "Gemini API key"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clip:
+    name: Find 2 highlights and render split-screen clips
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Remove forced legacy YouTube player clients
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("clipping/engine.py")
+          source = path.read_text(encoding="utf-8")
+          forced = '            "extractor_args": {"youtube": ["player_client=android,web"]},\n'
+          if forced in source:
+              path.write_text(source.replace(forced, "", 1), encoding="utf-8")
+              print("Removed forced android,web YouTube player clients; yt-dlp will choose defaults.")
+          else:
+              print("No matching legacy player-client override found; leaving engine.py unchanged.")
+          PY
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install FFmpeg and system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 libsm6 libxext6
+          ffmpeg -version
+          deno --version
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+          python -m pip install --no-cache-dir \
+            "numpy==1.26.4" \
+            "mediapipe==0.10.21" \
+            "opencv-python==4.11.0.86" \
+            Pillow requests python-dotenv faster-whisper google-genai tqdm
+
+      - name: Update yt-dlp
+        run: |
+          python -m pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
+          yt-dlp --version
+
+      - name: Prepare secrets and YouTube cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          GOOGLE_API_KEY: ${{ inputs.gemini_api_key }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GOOGLE_API_KEY:-}" ]]; then
+            echo "::error::Gemini API key is missing."
+            exit 1
+          fi
+          echo "::add-mask::$GOOGLE_API_KEY"
+          if [[ -z "${YOUTUBE_COOKIES:-}" ]]; then
+            echo "::error::Missing YOUTUBE_COOKIES repository secret. Add the full Netscape-format cookies.txt contents."
+            exit 1
+          fi
+          printf '%s' "$YOUTUBE_COOKIES" > "$RUNNER_TEMP/youtube_cookies.txt"
+          chmod 600 "$RUNNER_TEMP/youtube_cookies.txt"
+
+      - name: Download, find 2 highlights and render base clips
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          GOOGLE_API_KEY: ${{ inputs.gemini_api_key }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${VIDEO_URL//[[:space:]]/}" ]]; then
+            echo "::error::YouTube URL is missing."
+            exit 1
+          fi
+          mkdir -p outputs
+          python main.py \
+            --url "$VIDEO_URL" \
+            --source youtube \
+            --yt-cookies "$RUNNER_TEMP/youtube_cookies.txt" \
+            --clips 2 \
+            --ratio "3:4" \
+            --source-height max \
+            --render-height 1080 \
+            --ai-provider gemini \
+            --whisper-model base \
+            --whisper-device cpu \
+            --whisper-compute-type int8 \
+            --face-detector mediapipe \
+            --no-subs \
+            --no-broll \
+            --no-bgm \
+            --no-hook \
+            --no-segment-trim \
+            --video-crf 17 \
+            --video-preset slow \
+            --video-scale-algo lanczos
+
+      - name: Render facecam on top and gameplay below (1080x1440)
+        run: |
+          set -Eeuo pipefail
+          test -s video_asli.mp4
+          test -s outputs/render_manifest.json
+          python tools/streamer_gameplay_split.py \
+            --source video_asli.mp4 \
+            --manifest outputs/render_manifest.json \
+            --width 1080 \
+            --height 1440 \
+            --sample-interval 0.75 \
+            --facecam-sharpen 0.22 \
+            --crf 17 \
+            --preset slow
+
+      - name: Check generated clips
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find outputs -type f -name 'highlight_rank_*_ready.mp4' | wc -l)
+          echo "Generated final clips: $count"
+          if [[ "$count" -lt 1 ]]; then
+            echo "::error::No final MP4 clips were generated."
+            find outputs -maxdepth 4 -type f -print || true
+            exit 1
+          fi
+          find outputs -type f -name 'highlight_rank_*_ready.mp4' -exec ls -lh {} \;
+
+      - name: Upload final clips
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: facecam-gameplay-clips-1080x1440
+          path: outputs/**/highlight_rank_*_ready.mp4
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Remove temporary cookies
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/youtube_cookies.txt"
