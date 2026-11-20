@@ -282,6 +282,128 @@ def _estimate_webcam_frame(
     return best_rect, border_score
 
 
+
+def _border_only_webcam_candidates(
+    frame: np.ndarray, width: int, height: int
+) -> list[tuple[tuple[int, int, int, int], float]]:
+    """Find framed picture-in-picture regions without requiring a detected face.
+
+    The stream overlay uses cyan/purple accents. Closing small gaps joins the
+    colored frame edges into components; plausible corner-anchored components
+    are scored by geometry and colored-edge coverage.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hue, sat, val = cv2.split(hsv)
+    mask = (((sat > 75) & (val > 55) &
+             (((hue >= 78) & (hue <= 112)) | ((hue >= 120) & (hue <= 176))))
+            .astype(np.uint8) * 255)
+    # Join interrupted neon frame edges without merging distant scene details.
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    joined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+    joined = cv2.dilate(joined, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(joined, 8)
+    candidates: list[tuple[tuple[int, int, int, int], float]] = []
+    frame_area = float(width * height)
+    for i in range(1, count):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        if w < max(70, int(width * 0.075)) or h < max(55, int(height * 0.075)):
+            continue
+        if w > width * 0.48 or h > height * 0.48:
+            continue
+        aspect = w / max(1.0, h)
+        if not 1.05 <= aspect <= 2.35:
+            continue
+        # Webcam boxes in the source are docked to a screen edge/corner.
+        edge_gap = min(x, y, width - (x + w), height - (y + h))
+        if edge_gap > min(width, height) * 0.12:
+            continue
+        component = (labels[y:y+h, x:x+w] == i)
+        color_density = float(np.mean(component))
+        # Reject large colored scene objects; a frame is mostly perimeter, not fill.
+        if color_density > 0.90:
+            continue
+        size_fraction = (w * h) / frame_area
+        size_score = float(np.clip(1.0 - abs(size_fraction - 0.065) / 0.13, 0, 1))
+        aspect_score = float(np.exp(-abs(aspect - 1.45) * 0.8))
+        anchor_score = float(np.clip(1.0 - edge_gap / (min(width, height) * 0.12), 0, 1))
+        # Require colored pixels to touch at least two different sides.
+        side_cover = []
+        band = max(2, min(8, int(round(min(w, h) * 0.025))))
+        for roi in (component[:band, :], component[-band:, :],
+                    component[:, :band], component[:, -band:]):
+            side_cover.append(float(np.mean(np.any(roi, axis=0 if roi.shape[0] <= roi.shape[1] else 1))))
+        side_count = sum(v >= 0.12 for v in side_cover)
+        if side_count < 2:
+            continue
+        score = 2.2 * size_score + 1.2 * aspect_score + 1.6 * anchor_score + 0.7 * min(side_count / 4, 1.0)
+        # Slightly pad the connected border to include the webcam image interior.
+        pad_x, pad_y = max(2, int(w * 0.012)), max(2, int(h * 0.025))
+        rect = _clamp_rect(x - pad_x, y - pad_y, x + w + pad_x, y + h + pad_y, width, height)
+        candidates.append((rect, score))
+    return sorted(candidates, key=lambda item: item[1], reverse=True)
+
+
+def _detect_webcam_from_border(
+    cap: cv2.VideoCapture, start: float, end: float, width: int, height: int,
+    sample_interval: float, facecam_corner: str = "auto",
+) -> tuple[int, int, int, int]:
+    """Temporal consensus fallback: locate the same neon-framed inset over time."""
+    interval = max(0.25, sample_interval)
+    sample_count = min(90, max(3, int(np.ceil(max(0.0, end - start) / interval))))
+    sample_times = np.linspace(start + min(0.15, max(0.0, end-start) * 0.05),
+                               max(start, end - 0.15), sample_count)
+    observations: list[tuple[tuple[int, int, int, int], float]] = []
+    for timestamp in sample_times:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        for rect, score in _border_only_webcam_candidates(frame, width, height)[:4]:
+            x1, y1, x2, y2 = rect
+            cx, cy = (x1+x2)/2, (y1+y2)/2
+            if facecam_corner != "auto":
+                allowed = {
+                    "top-left": cx < width*0.5 and cy < height*0.5,
+                    "top-right": cx > width*0.5 and cy < height*0.5,
+                    "bottom-left": cx < width*0.5 and cy > height*0.5,
+                    "bottom-right": cx > width*0.5 and cy > height*0.5,
+                }[facecam_corner]
+                if not allowed:
+                    continue
+            observations.append((rect, score))
+    if not observations:
+        raise RuntimeError(
+            "No facecam face was detected, and the border-only fallback could not "
+            "find a stable cyan/purple webcam frame. Check whether the webcam border "
+            "is visible in the original source video."
+        )
+    # Group detections by center and size; the true overlay remains in one place.
+    groups: list[list[tuple[tuple[int, int, int, int], float]]] = []
+    for observation in observations:
+        rect, _ = observation
+        cx, cy = (rect[0]+rect[2])/2, (rect[1]+rect[3])/2
+        rw, rh = rect[2]-rect[0], rect[3]-rect[1]
+        best_group, best_dist = None, float("inf")
+        for group in groups:
+            gr = group[-1][0]
+            gcx, gcy = (gr[0]+gr[2])/2, (gr[1]+gr[3])/2
+            grw, grh = gr[2]-gr[0], gr[3]-gr[1]
+            dist = np.hypot((cx-gcx)/width, (cy-gcy)/height)
+            size_delta = abs(np.log(max(1,rw)/max(1,grw))) + abs(np.log(max(1,rh)/max(1,grh)))
+            if dist < 0.08 and size_delta < 0.75 and dist < best_dist:
+                best_group, best_dist = group, dist
+        if best_group is None:
+            groups.append([observation])
+        else:
+            best_group.append(observation)
+    best_group = max(groups, key=lambda g: len(g) * (sum(x[1] for x in g)/len(g)))
+    if len(best_group) < 2:
+        raise RuntimeError("Border-only webcam detection was not stable across multiple samples.")
+    rects = np.array([x[0] for x in best_group], dtype=np.float32)
+    chosen = tuple(int(round(v)) for v in np.median(rects, axis=0))
+    log(f"  Border-only webcam detection: frame={chosen}, stable_samples={len(best_group)}")
+    return chosen
+
 def detect_facecam_region(
     cap: cv2.VideoCapture,
     detector,
@@ -372,10 +494,11 @@ def detect_facecam_region(
                 assigned.add(best_track)
 
     if not tracks:
-        raise RuntimeError(
-            "AI could not find a facecam face in the selected highlight. "
-            "The source may be too small/blurry, or the facecam may be hidden."
+        log("  Face detector found no faces; trying border-only webcam detection...")
+        face_rect = _detect_webcam_from_border(
+            cap, start, end, width, height, sample_interval, facecam_corner
         )
+        return face_rect, choose_gameplay_crop(width, height, face_rect)
 
     total_samples = max(1, valid_sample_count)
     scored_tracks = []
@@ -413,18 +536,20 @@ def detect_facecam_region(
         scored_tracks.append((score, track, median_box, frame_rect, persistence, edge_score, border_score))
 
     if not scored_tracks:
-        raise RuntimeError(
-            "Face detections were too brief to track a webcam frame. "
-            "Try a longer highlight or lower --sample-interval."
+        log("  Face detections could not confirm a webcam; trying border-only detection...")
+        face_rect = _detect_webcam_from_border(
+            cap, start, end, width, height, sample_interval, facecam_corner
         )
+        return face_rect, choose_gameplay_crop(width, height, face_rect)
 
     scored_tracks.sort(key=lambda entry: entry[0], reverse=True)
     best = scored_tracks[0]
     if best[0] < 4.0 or best[4] < 0.10 or best[6] < 0.20:
-        raise RuntimeError(
-            "No reliable bordered streamer webcam was found. Refusing to crop a random game character. "
-            "The facecam may be too small or its frame border may not be visible."
+        log("  Face-based candidate was not reliable; trying border-only detection...")
+        face_rect = _detect_webcam_from_border(
+            cap, start, end, width, height, sample_interval, facecam_corner
         )
+        return face_rect, choose_gameplay_crop(width, height, face_rect)
 
     face_rect = best[3]
     game_rect = choose_gameplay_crop(width, height, face_rect)
