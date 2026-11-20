@@ -1,0 +1,537 @@
+name: AI Stream Clipper - 4K Facecam + Gameplay
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Paste your YouTube video or completed livestream URL"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clip:
+    name: Find 2 highlights and render 1080x1440 facecam/gameplay clips
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install FFmpeg and system libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 libsm6 libxext6
+          ffmpeg -version
+          ffprobe -version
+          deno --version
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+          python -m pip install --no-cache-dir \
+            "numpy==1.26.4" \
+            "mediapipe==0.10.21" \
+            "opencv-contrib-python==4.11.0.86" \
+            Pillow requests python-dotenv faster-whisper google-genai tqdm
+
+      - name: Update yt-dlp
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
+          yt-dlp --version
+
+      - name: Install CPU Real-ESRGAN and GFPGAN
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use matched CPU-only PyTorch wheels so the AI enhancer works on a standard GitHub runner.
+          python -m pip install --no-cache-dir \
+            "torch==2.2.2" "torchvision==0.17.2" \
+            --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir \
+            "basicsr==1.4.2" \
+            "facexlib==0.3.0" \
+            "gfpgan==1.3.8" \
+            "realesrgan==0.3.0"
+          # Keep the OpenCV build compatible with MediaPipe and the existing renderer.
+          python -m pip uninstall -y opencv-python || true
+          python -m pip install --no-cache-dir --force-reinstall --no-deps \
+            "numpy==1.26.4" "opencv-contrib-python==4.11.0.86"
+          python - <<'PY'
+          import sys
+          import torch
+          import torchvision.transforms.functional as tv_functional
+          sys.modules.setdefault("torchvision.transforms.functional_tensor", tv_functional)
+          from basicsr.archs.rrdbnet_arch import RRDBNet
+          from realesrgan import RealESRGANer
+          from gfpgan import GFPGANer
+          print("CPU super-resolution stack imports successfully.")
+          print("PyTorch:", torch.__version__)
+          PY
+
+      - name: Configure YouTube player client for main and 4K downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          engine_path = Path("clipping/engine.py")
+          engine = engine_path.read_text(encoding="utf-8")
+          old_engine = '            "extractor_args": {"youtube": ["player_client=android,web"]},\n'
+          new_engine = (
+              '            "extractor_args": {"youtube": ["player_client=default,-web_embedded"]},\n'
+              '            "force_ipv4": True,\n'
+          )
+
+          if old_engine in engine:
+              engine = engine.replace(old_engine, new_engine, 1)
+              engine_path.write_text(engine, encoding="utf-8")
+              print("Configured the main YouTube downloader.")
+          elif '"player_client=default,-web_embedded"' in engine and '"force_ipv4": True' in engine:
+              print("Main YouTube downloader is already configured.")
+          else:
+              raise SystemExit("Could not safely find the expected YouTube settings in clipping/engine.py")
+
+          facecam_path = Path("tools/download_facecam_4k_segments.py")
+          facecam = facecam_path.read_text(encoding="utf-8")
+          old_facecam = '            "--remote-components", "ejs:github",\n'
+          new_facecam = (
+              old_facecam
+              + '            "--extractor-args", "youtube:player_client=default,-web_embedded",\n'
+              + '            "--force-ipv4",\n'
+          )
+
+          if old_facecam in facecam and '"--extractor-args", "youtube:player_client=default,-web_embedded"' not in facecam:
+              facecam = facecam.replace(old_facecam, new_facecam, 1)
+              facecam_path.write_text(facecam, encoding="utf-8")
+              print("Configured the 4K facecam segment downloader.")
+          elif '"--extractor-args", "youtube:player_client=default,-web_embedded"' in facecam:
+              print("4K facecam downloader is already configured.")
+          else:
+              raise SystemExit("Could not safely configure tools/download_facecam_4k_segments.py")
+          PY
+          python -m py_compile clipping/engine.py tools/download_facecam_4k_segments.py
+
+      - name: Enable Real-ESRGAN x4 and GFPGAN face restoration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools weights
+          cat > tools/facecam_quality_enhancer.py <<'PY'
+          """CPU Real-ESRGAN x4 + GFPGAN v1.4 enhancement for low-resolution facecam crops."""
+          from __future__ import annotations
+
+          import os
+          import sys
+          import urllib.request
+          from pathlib import Path
+
+          import torch
+          import torchvision.transforms.functional as tv_functional
+
+          # BasicSR 1.4.2 imports a torchvision compatibility module removed in newer releases.
+          sys.modules.setdefault("torchvision.transforms.functional_tensor", tv_functional)
+
+          from basicsr.archs.rrdbnet_arch import RRDBNet
+          from realesrgan import RealESRGANer
+          from gfpgan import GFPGANer
+
+          REAL_ESRGAN_URL = (
+              "https://github.com/xinntao/Real-ESRGAN/releases/download/"
+              "v0.1.0/RealESRGAN_x4plus.pth"
+          )
+          GFPGAN_URL = (
+              "https://github.com/TencentARC/GFPGAN/releases/download/"
+              "v1.3.0/GFPGANv1.4.pth"
+          )
+
+          def _download_model(url: str, path: Path) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if path.is_file() and path.stat().st_size > 10_000_000:
+                  return
+              temporary = path.with_suffix(path.suffix + ".download")
+              temporary.unlink(missing_ok=True)
+              print(f"Downloading AI model: {path.name}", flush=True)
+              urllib.request.urlretrieve(url, temporary)
+              if not temporary.is_file() or temporary.stat().st_size <= 10_000_000:
+                  temporary.unlink(missing_ok=True)
+                  raise RuntimeError(f"AI model download is incomplete: {path.name}")
+              temporary.replace(path)
+
+          class FacecamQualityEnhancer:
+              """Enhance an entire facecam crop; GFPGAN refines the central face."""
+
+              def __init__(self, weights_dir: Path = Path("weights"), tile: int = 192):
+                  threads = max(1, int(os.environ.get("OMP_NUM_THREADS", "4")))
+                  torch.set_num_threads(threads)
+                  try:
+                      torch.set_num_interop_threads(1)
+                  except RuntimeError:
+                      pass
+                  self.device = torch.device("cpu")
+
+                  esr_path = weights_dir / "RealESRGAN_x4plus.pth"
+                  gfp_path = weights_dir / "GFPGANv1.4.pth"
+                  _download_model(REAL_ESRGAN_URL, esr_path)
+                  _download_model(GFPGAN_URL, gfp_path)
+
+                  network = RRDBNet(
+                      num_in_ch=3, num_out_ch=3, num_feat=64,
+                      num_block=23, num_grow_ch=32, scale=4,
+                  )
+                  self.upsampler = RealESRGANer(
+                      scale=4,
+                      model_path=str(esr_path),
+                      model=network,
+                      tile=tile,
+                      tile_pad=16,
+                      pre_pad=0,
+                      half=False,
+                      device=self.device,
+                  )
+                  self.face_restorer = GFPGANer(
+                      model_path=str(gfp_path),
+                      upscale=4,
+                      arch="clean",
+                      channel_multiplier=2,
+                      bg_upsampler=self.upsampler,
+                      device=self.device,
+                  )
+                  self.warned = False
+                  print(
+                      "Facecam enhancer ready: Real-ESRGAN x4 + GFPGAN v1.4 (CPU).",
+                      flush=True,
+                  )
+
+              def enhance(self, frame):
+                  # A restrained blend reduces the risk of changing the streamer's identity.
+                  try:
+                      _crops, _faces, restored = self.face_restorer.enhance(
+                          frame,
+                          has_aligned=False,
+                          only_center_face=True,
+                          paste_back=True,
+                          weight=0.70,
+                      )
+                      if restored is not None and restored.size:
+                          return restored
+                  except Exception as exc:
+                      if not self.warned:
+                          print(
+                              f"WARNING: GFPGAN face restore failed; using Real-ESRGAN only: {exc}",
+                              flush=True,
+                          )
+                          self.warned = True
+
+                  try:
+                      upscaled, _ = self.upsampler.enhance(frame, outscale=4)
+                      return upscaled
+                  except Exception as exc:
+                      if not self.warned:
+                          print(f"WARNING: AI upscaling failed; using original crop: {exc}", flush=True)
+                          self.warned = True
+                      return frame
+          PY
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/streamer_gameplay_split.py")
+          source = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"Cannot patch {label}: expected one match, found {count}.")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              "from mediapipe.tasks.python import vision as mp_vision\n",
+              "from mediapipe.tasks.python import vision as mp_vision\n"
+              "from facecam_quality_enhancer import FacecamQualityEnhancer\n",
+              "enhancer import",
+          )
+          replace_once(
+              "    facecam_trim_right: float,\n    facecam_trim_bottom: float,\n) -> float:",
+              "    facecam_trim_right: float,\n    facecam_trim_bottom: float,\n    enhancer=None,\n) -> float:",
+              "render function signature",
+          )
+          replace_once(
+              '    log(\n'
+              '        f"  Facecam source: {face_w}x{face_h} at {face_fps:.2f} fps; "\n'
+              '        f"game source: {source_w}x{source_h} at {fps:.2f} fps"\n'
+              '    )\n',
+              '    log(\n'
+              '        f"  Facecam source: {face_w}x{face_h} at {face_fps:.2f} fps; "\n'
+              '        f"game source: {source_w}x{source_h} at {fps:.2f} fps"\n'
+              '    )\n'
+              '    if face_h >= 2160:\n'
+              '        log("  Facecam quality path: genuine 4K+ source; AI upscaling disabled.")\n'
+              '    elif enhancer is not None:\n'
+              '        log("  Facecam quality path: Real-ESRGAN x4 + GFPGAN v1.4 restoration.")\n'
+              '    else:\n'
+              '        log("  WARNING: low-resolution facecam is using standard resizing.")\n',
+              "quality path log",
+          )
+          replace_once(
+              '            bottom = crop_rect(frame, game_rect)\n\n'
+              '            # Lanczos gives a clean downsample from a 4K facecam crop. A little\n'
+              '            # unsharp masking only compensates for encoder softness; it cannot\n'
+              '            # invent camera detail that was not in the source stream.\n'
+              '            top = cv2.resize(top, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)',
+              '            bottom = crop_rect(frame, game_rect)\n\n'
+              '            # Prefer the genuine 4K stream. Otherwise restore and upscale the actual\n'
+              '            # webcam crop before resizing it into the 1080x720 top panel.\n'
+              '            if enhancer is not None and face_h < 2160:\n'
+              '                top = enhancer.enhance(top)\n'
+              '            top = cv2.resize(top, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)',
+              "per-frame enhancement",
+          )
+          replace_once(
+              '    parser.add_argument("--facecam-sharpen", type=float, default=0.15)\n',
+              '    parser.add_argument("--facecam-sharpen", type=float, default=0.15)\n'
+              '    parser.add_argument("--no-facecam-enhance", action="store_true",\n'
+              '                        help="Disable Real-ESRGAN/GFPGAN enhancement when native 4K is unavailable.")\n',
+              "enhancement CLI option",
+          )
+          replace_once(
+              '    clips = load_manifest(manifest_path)\n'
+              '    detector = create_detector(args.model)\n'
+              '    success = 0',
+              '    clips = load_manifest(manifest_path)\n'
+              '    detector = create_detector(args.model)\n'
+              '    enhancer = None\n'
+              '    if not args.no_facecam_enhance:\n'
+              '        needs_enhancement = False\n'
+              '        root = manifest_path.parent.parent\n'
+              '        for item in clips:\n'
+              '            value = item.get("facecam_source_path")\n'
+              '            candidate = Path(str(value)) if value else source\n'
+              '            if not candidate.is_absolute():\n'
+              '                candidate = (root / candidate).resolve()\n'
+              '            if not candidate.is_file():\n'
+              '                candidate = source\n'
+              '            probe = cv2.VideoCapture(str(candidate))\n'
+              '            candidate_height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) if probe.isOpened() else 0\n'
+              '            probe.release()\n'
+              '            if candidate_height < 2160:\n'
+              '                needs_enhancement = True\n'
+              '                break\n'
+              '        if needs_enhancement:\n'
+              '            enhancer = FacecamQualityEnhancer(weights_dir=Path("weights"), tile=192)\n'
+              '        else:\n'
+              '            log("All selected facecam sources are 4K+; skipping AI model initialization.")\n'
+              '    success = 0',
+              "initialize enhancer only when required",
+          )
+          replace_once(
+              '                args.facecam_trim_right, args.facecam_trim_bottom,\n'
+              '            )',
+              '                args.facecam_trim_right, args.facecam_trim_bottom, enhancer,\n'
+              '            )',
+              "pass enhancer to renderer",
+          )
+
+          path.write_text(source, encoding="utf-8")
+          print("Installed Real-ESRGAN/GFPGAN fallback in the facecam renderer.")
+          PY
+
+          python -m py_compile tools/facecam_quality_enhancer.py tools/streamer_gameplay_split.py
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+
+          # The helper is created under tools/, while this validation script
+          # runs from the repository root. Add tools/ so Python can import it.
+          sys.path.insert(0, str(Path("tools").resolve()))
+
+          import torchvision.transforms.functional as tv_functional
+          sys.modules.setdefault("torchvision.transforms.functional_tensor", tv_functional)
+          from basicsr.archs.rrdbnet_arch import RRDBNet
+          from realesrgan import RealESRGANer
+          from gfpgan import GFPGANer
+          from facecam_quality_enhancer import FacecamQualityEnhancer
+          print("Facecam restoration code passed import validation.")
+          PY
+
+      - name: Validate Gemini secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GOOGLE_API_KEY:-}" ]]; then
+            echo "::error::Missing GEMINI_API_KEY repository secret."
+            exit 1
+          fi
+          echo "::add-mask::$GOOGLE_API_KEY"
+
+      - name: Prepare and validate YouTube cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          raw = os.environ.get("YOUTUBE_COOKIES", "")
+          if not raw.strip():
+              raise SystemExit(
+                  "Missing YOUTUBE_COOKIES repository secret. Add your signed-in YouTube cookies.txt "
+                  "in Netscape format to GitHub Actions secrets."
+              )
+
+          cookie_path = Path(os.environ["RUNNER_TEMP"]) / "youtube_cookies.txt"
+          cookie_path.write_text(raw.rstrip() + "\n", encoding="utf-8")
+          cookie_path.chmod(0o600)
+
+          youtube_rows = [
+              line for line in raw.splitlines()
+              if len(line.split("\t")) >= 7 and "youtube.com" in line.split("\t", 1)[0].lower()
+          ]
+          if not youtube_rows:
+              cookie_path.unlink(missing_ok=True)
+              raise SystemExit(
+                  "YOUTUBE_COOKIES is not a Netscape cookies.txt file or contains no youtube.com entries. "
+                  "Export cookies while signed in to YouTube."
+              )
+
+          print(f"Validated Netscape cookies file ({len(youtube_rows)} YouTube cookie entries).")
+          PY
+
+      - name: Download, find 2 highlights and render base clips
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${VIDEO_URL//[[:space:]]/}" ]]; then
+            echo "::error::YouTube URL is missing."
+            exit 1
+          fi
+
+          test -s "$RUNNER_TEMP/youtube_cookies.txt"
+          mkdir -p outputs
+
+          python main.py \
+            --url "$VIDEO_URL" \
+            --source youtube \
+            --yt-cookies "$RUNNER_TEMP/youtube_cookies.txt" \
+            --clips 2 \
+            --ratio "3:4" \
+            --source-height max \
+            --render-height 1080 \
+            --ai-provider gemini \
+            --whisper-model base \
+            --whisper-device cpu \
+            --whisper-compute-type int8 \
+            --face-detector mediapipe \
+            --no-subs \
+            --no-karaoke \
+            --no-broll \
+            --no-bgm \
+            --no-hook \
+            --no-segment-trim \
+            --video-crf 17 \
+            --video-preset slow \
+            --video-scale-algo lanczos
+
+          test -s video_asli.mp4
+          test -s outputs/render_manifest.json
+
+      - name: Download selected 4K facecam segments when available
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if python tools/download_facecam_4k_segments.py \
+            --url "$VIDEO_URL" \
+            --manifest outputs/render_manifest.json \
+            --source video_asli.mp4 \
+            --cookies "$RUNNER_TEMP/youtube_cookies.txt" \
+            --output-dir "$RUNNER_TEMP/facecam_4k_segments"; then
+            echo "4K facecam segment step completed."
+          else
+            echo "::warning::No 4K rendition was available. The renderer will apply Real-ESRGAN x4 and GFPGAN v1.4 to the best available facecam source."
+          fi
+
+      - name: Render facecam on top and gameplay below (1080x1440)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -s video_asli.mp4
+          test -s outputs/render_manifest.json
+
+          python tools/streamer_gameplay_split.py \
+            --source video_asli.mp4 \
+            --manifest outputs/render_manifest.json \
+            --width 1080 \
+            --height 1440 \
+            --sample-interval 0.75 \
+            --facecam-sharpen 0.10 \
+            --facecam-trim-left 0.02 \
+            --facecam-trim-top 0.12 \
+            --facecam-trim-right 0.02 \
+            --facecam-trim-bottom 0.10 \
+            --crf 13 \
+            --preset slow
+
+      - name: Check generated clips
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p outputs
+          count=$(find outputs -type f -name 'highlight_rank_*_ready.mp4' | wc -l)
+          echo "Generated final facecam/gameplay clips: $count"
+          if [[ "$count" -lt 1 ]]; then
+            echo "::error::No final MP4 clips were generated."
+            find outputs -maxdepth 5 -type f -print || true
+            exit 1
+          fi
+          find outputs -type f -name 'highlight_rank_*_ready.mp4' -exec ls -lh {} \;
+
+      - name: Upload final clips
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: facecam-gameplay-clips-1080x1440
+          path: outputs/**/highlight_rank_*_ready.mp4
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Remove temporary YouTube cookies
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/youtube_cookies.txt"
