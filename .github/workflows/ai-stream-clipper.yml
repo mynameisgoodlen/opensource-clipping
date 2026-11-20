@@ -34,7 +34,7 @@ jobs:
           path = Path("clipping/engine.py")
           source = path.read_text(encoding="utf-8")
           forced = '            "extractor_args": {"youtube": ["player_client=default,-web_embedded"]},
-"force_ipv4": True,
+"force_ipv4": True,'
               path.write_text(source.replace(forced, "", 1), encoding="utf-8")
               print("Removed forced android,web YouTube player clients; yt-dlp will choose defaults.")
           else:
