@@ -66,19 +66,152 @@ def create_detector(model_path: Path):
     return detector
 
 
-def _face_boxes(detector, frame: np.ndarray) -> list[tuple[float, float, float, float]]:
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-    found = []
-    for detection in result.detections or []:
-        box = detection.bounding_box
-        x1 = float(box.origin_x)
-        y1 = float(box.origin_y)
-        x2 = float(box.origin_x + box.width)
-        y2 = float(box.origin_y + box.height)
-        if x2 > x1 and y2 > y1:
-            found.append((x1, y1, x2, y2))
-    return found
+def _face_boxes(detector, frame: np.ndarray) -> list[tuple[float, float, float, float, float]]:
+    """Return face boxes and confidence, checking an enlarged copy for small insets."""
+    h, w = frame.shape[:2]
+    detections: list[tuple[float, float, float, float, float]] = []
+    # The webcam is often much smaller than game characters. A second, enlarged
+    # pass improves detection of the inset without relying on its screen corner.
+    for scale in (1.0, min(1.6, 2560.0 / max(w, h))):
+        if scale <= 1.01:
+            candidate = frame
+        else:
+            candidate = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        rgb = cv2.cvtColor(candidate, cv2.COLOR_BGR2RGB)
+        result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+        for detection in result.detections or []:
+            box = detection.bounding_box
+            x1 = float(box.origin_x) / scale
+            y1 = float(box.origin_y) / scale
+            x2 = float(box.origin_x + box.width) / scale
+            y2 = float(box.origin_y + box.height) / scale
+            score = float(detection.categories[0].score) if detection.categories else 0.0
+            if x2 > x1 and y2 > y1:
+                detections.append((x1, y1, x2, y2, score))
+
+    # Merge duplicates from the original-size and enlarged passes.
+    detections.sort(key=lambda item: item[4], reverse=True)
+    merged: list[tuple[float, float, float, float, float]] = []
+    for box in detections:
+        x1, y1, x2, y2, _ = box
+        area = max(1.0, (x2 - x1) * (y2 - y1))
+        duplicate = False
+        for kept in merged:
+            kx1, ky1, kx2, ky2, _ = kept
+            iw = max(0.0, min(x2, kx2) - max(x1, kx1))
+            ih = max(0.0, min(y2, ky2) - max(y1, ky1))
+            inter = iw * ih
+            kept_area = max(1.0, (kx2 - kx1) * (ky2 - ky1))
+            if inter / max(1.0, area + kept_area - inter) > 0.52:
+                duplicate = True
+                break
+        if not duplicate:
+            merged.append(box)
+    return merged
+
+def _clamp_rect(
+    x1: float, y1: float, x2: float, y2: float, width: int, height: int
+) -> tuple[int, int, int, int]:
+    x1 = int(np.clip(round(x1), 0, width - 2))
+    y1 = int(np.clip(round(y1), 0, height - 2))
+    x2 = int(np.clip(round(x2), x1 + 2, width))
+    y2 = int(np.clip(round(y2), y1 + 2, height))
+    return x1, y1, x2, y2
+
+
+def _rect_border_score(frame: np.ndarray, rect: tuple[int, int, int, int], edges: np.ndarray | None = None) -> float:
+    """Measure whether a proposed webcam crop follows a visible inset-frame border."""
+    x1, y1, x2, y2 = rect
+    h, w = frame.shape[:2]
+    if x2 - x1 < 24 or y2 - y1 < 24:
+        return 0.0
+    if edges is None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 55, 145)
+    band = max(2, min(7, int(round(min(x2 - x1, y2 - y1) * 0.025))))
+    inset = max(4, int(round(min(x2 - x1, y2 - y1) * 0.06)))
+    densities: list[float] = []
+
+    # Ignore edges that coincide with the video boundary: the webcam box may
+    # deliberately touch the left/right/bottom edge of the livestream.
+    if y1 > 1:
+        roi = edges[max(0, y1 - band):min(h, y1 + band + 1), min(w, x1 + inset):max(0, x2 - inset)]
+        if roi.size:
+            densities.append(float(np.count_nonzero(roi)) / roi.size)
+    if y2 < h - 1:
+        roi = edges[max(0, y2 - band):min(h, y2 + band + 1), min(w, x1 + inset):max(0, x2 - inset)]
+        if roi.size:
+            densities.append(float(np.count_nonzero(roi)) / roi.size)
+    if x1 > 1:
+        roi = edges[min(h, y1 + inset):max(0, y2 - inset), max(0, x1 - band):min(w, x1 + band + 1)]
+        if roi.size:
+            densities.append(float(np.count_nonzero(roi)) / roi.size)
+    if x2 < w - 1:
+        roi = edges[min(h, y1 + inset):max(0, y2 - inset), max(0, x2 - band):min(w, x2 + band + 1)]
+        if roi.size:
+            densities.append(float(np.count_nonzero(roi)) / roi.size)
+
+    if not densities:
+        return 0.0
+    # A clean border can have a high edge density, but cap the score so HUD
+    # text or busy gameplay edges cannot dominate face tracking.
+    return float(np.clip(np.mean(densities) / 0.20, 0.0, 1.0))
+
+
+def _estimate_webcam_frame(
+    frame: np.ndarray, face_box: tuple[float, float, float, float]
+) -> tuple[tuple[int, int, int, int], float]:
+    """Expand a tracked face to the surrounding webcam frame, using border evidence."""
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = face_box
+    face_w = max(2.0, x2 - x1)
+    face_h = max(2.0, y2 - y1)
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+
+    # A streamer face generally occupies roughly one-third of the webcam
+    # frame's height. Test several conventional overlay shapes and let visible
+    # border lines select the best fit. The 16:10 / 3x-height prior is only a
+    # fallback when the overlay has no visible border.
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edge_map = cv2.Canny(gray, 55, 145)
+    best_rect = None
+    best_score = -1.0
+    for aspect in (1.50, 1.60, 1.78, 1.91):
+        for height_scale in (3.15, 3.30, 3.45, 3.60):
+            cam_h = max(face_h * height_scale, face_w * 2.65)
+            cam_w = cam_h * aspect
+            for offset_x in (-0.06, 0.0, 0.06):
+                for offset_y in (-0.07, 0.0, 0.07):
+                    cx = center_x + cam_w * offset_x
+                    cy = center_y + cam_h * offset_y
+                    rect = _clamp_rect(
+                        cx - cam_w / 2.0,
+                        cy - cam_h / 2.0,
+                        cx + cam_w / 2.0,
+                        cy + cam_h / 2.0,
+                        width,
+                        height,
+                    )
+                    actual_w = rect[2] - rect[0]
+                    actual_h = rect[3] - rect[1]
+                    if actual_w < face_w * 2.5 or actual_h < face_h * 2.2:
+                        continue
+                    border = _rect_border_score(frame, rect, edge_map)
+                    prior = np.exp(
+                        -abs(aspect - 1.60) * 1.6
+                        -abs(height_scale - 3.30) * 0.70
+                        -abs(offset_x) * 2.0
+                        -abs(offset_y) * 2.0
+                    )
+                    score = 1.30 * border + 0.70 * float(prior)
+                    if score > best_score:
+                        best_score = score
+                        best_rect = rect
+
+    if best_rect is None:
+        raise RuntimeError("Could not estimate the webcam frame around the detected face.")
+    return best_rect, max(0.0, best_score)
 
 
 def detect_facecam_region(
@@ -91,178 +224,197 @@ def detect_facecam_region(
     sample_interval: float,
     facecam_corner: str = "auto",
 ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
-    """Return (facecam crop rect, gameplay crop rect) for this clip."""
-    duration = max(0.1, end - start)
-    sample_count = min(90, max(3, int(duration / sample_interval) + 1))
-    times = np.linspace(start, max(start, end - 0.05), sample_count)
+    """Find the streamer inset by tracking persistent faces and locating its frame.
 
-    # Cluster observations by normalized face-center position. Streamer facecam
-    # overlays tend to remain in one location, unlike faces in gameplay footage.
-    clusters: list[list[tuple[float, float, float, float, int]]] = []
-    frame_count = 0
-    for sample_no, timestamp in enumerate(times):
+    The game may contain many faces. The webcam candidate is selected using
+    temporal position/size consistency, small face scale, screen-edge location,
+    and evidence of a rectangular inset border. No corner is assumed.
+    """
+    corners = ("top-left", "top-right", "bottom-left", "bottom-right")
+    if facecam_corner not in ("auto", *corners):
+        raise ValueError(f"Unsupported facecam corner: {facecam_corner}")
+    if detector is None:
+        raise RuntimeError("Face detector was not initialized; install mediapipe and retry.")
+
+    duration = max(0.0, end - start)
+    interval = max(0.25, sample_interval)
+    sample_count = min(90, max(3, int(np.ceil(duration / interval))))
+    sample_times = np.linspace(start + min(0.15, duration * 0.05), max(start, end - 0.15), sample_count)
+    tracks: list[dict[str, Any]] = []
+    valid_sample_count = 0
+
+    for sample_index, timestamp in enumerate(sample_times):
         cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000.0)
         ok, frame = cap.read()
-        if not ok:
+        if not ok or frame is None:
             continue
-        frame_count += 1
+        valid_sample_count += 1
         boxes = _face_boxes(detector, frame)
-        # Limit pathological crowd frames; keep the larger detections.
-        boxes = sorted(
-            boxes,
-            key=lambda b: (b[2] - b[0]) * (b[3] - b[1]),
-            reverse=True,
-        )[:8]
-        assigned: set[int] = set()
-        for box in boxes:
-            cx = ((box[0] + box[2]) / 2.0) / width
-            cy = ((box[1] + box[3]) / 2.0) / height
-            best_idx = None
-            best_dist = 1e9
-            for idx, cluster in enumerate(clusters):
-                if idx in assigned:
-                    continue
-                ccx = median(item[0] for item in cluster)
-                ccy = median(item[1] for item in cluster)
-                distance = ((cx - ccx) ** 2 + (cy - ccy) ** 2) ** 0.5
-                if distance < best_dist:
-                    best_idx, best_dist = idx, distance
-            if best_idx is not None and best_dist <= 0.105:
-                clusters[best_idx].append((cx, cy, *box, sample_no))
-                assigned.add(best_idx)
-            else:
-                clusters.append([(cx, cy, *box, sample_no)])
-                assigned.add(len(clusters) - 1)
-
-    if not clusters:
-        raise RuntimeError(
-            f"No face was detected between {start:.2f}s and {end:.2f}s. "
-            "This split layout needs a visible facecam; check the source or set a manual facecam crop."
-        )
-
-    # A streamer inset is normally anchored near a screen corner. A GTA/NPC face
-    # in a centered cutscene can remain visible for an entire clip, so raw
-    # persistence alone is not enough to identify the webcam.
-    corners = {
-        "top-left": (lambda x, y: x <= 0.48 and y <= 0.48, 1.08),
-        "top-right": (lambda x, y: x >= 0.52 and y <= 0.48, 1.05),
-        "bottom-left": (lambda x, y: x <= 0.48 and y >= 0.52, 1.55),
-        "bottom-right": (lambda x, y: x >= 0.52 and y >= 0.52, 1.35),
-    }
-    if facecam_corner != "auto" and facecam_corner not in corners:
-        raise ValueError(f"Unsupported facecam corner: {facecam_corner}")
-
-    ranked = []
-    for cluster in clusters:
-        cx = float(median(item[0] for item in cluster))
-        cy = float(median(item[1] for item in cluster))
-        areas = [max(1.0, (item[4] - item[2]) * (item[5] - item[3])) for item in cluster]
-        avg_area_fraction = float(np.median(areas)) / float(width * height)
-        xs = [item[0] for item in cluster]
-        ys = [item[1] for item in cluster]
-        positional_jitter = float(np.std(xs) + np.std(ys))
-        stability = max(0.15, 1.0 - 2.2 * positional_jitter)
-        # Prefer a small inset-camera face over large cutscene close-ups.
-        size_score = float(np.exp(-0.22 * abs(np.log(max(avg_area_fraction, 1e-7) / 0.010))))
-        coverage = len(cluster) / max(1, frame_count)
-
-        matching_corner = None
-        corner_multiplier = 0.22  # centered gameplay faces are only a fallback
-        for name, (matches, multiplier) in corners.items():
-            if matches(cx, cy):
-                matching_corner = name
-                corner_multiplier = multiplier
-                break
-        if facecam_corner != "auto":
-            if matching_corner != facecam_corner:
+        # Reject impossible detections and very large gameplay close-ups.
+        usable = []
+        for x1, y1, x2, y2, confidence in boxes:
+            fw, fh = x2 - x1, y2 - y1
+            area_ratio = (fw * fh) / float(width * height)
+            aspect = fw / max(fh, 1.0)
+            if fw < 18 or fh < 18 or area_ratio > 0.085 or not 0.52 <= aspect <= 1.65:
                 continue
-            corner_multiplier = 1.0
+            if facecam_corner != "auto":
+                cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                in_corner = {
+                    "top-left": cx < width * 0.48 and cy < height * 0.48,
+                    "top-right": cx > width * 0.52 and cy < height * 0.48,
+                    "bottom-left": cx < width * 0.48 and cy > height * 0.52,
+                    "bottom-right": cx > width * 0.52 and cy > height * 0.52,
+                }[facecam_corner]
+                if not in_corner:
+                    continue
+            usable.append((x1, y1, x2, y2, confidence))
 
-        score = coverage * stability * size_score * corner_multiplier
-        ranked.append((score, len(cluster), matching_corner or "center", cluster))
+        # Associate detections across sampled frames. A webcam face can move
+        # within its box, so use a tolerant center-distance gate plus scale.
+        assigned: set[int] = set()
+        for detection in usable:
+            x1, y1, x2, y2, confidence = detection
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            fw, fh = x2 - x1, y2 - y1
+            best_track, best_distance = None, float("inf")
+            for track_index, track in enumerate(tracks):
+                if track_index in assigned:
+                    continue
+                last = track["items"][-1]
+                lx1, ly1, lx2, ly2, _ = last["box"]
+                lcx, lcy = (lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0
+                lfh = max(1.0, ly2 - ly1)
+                distance = float(np.hypot((cx - lcx) / width, (cy - lcy) / height))
+                scale_change = abs(np.log(max(1.0, fh) / lfh))
+                if distance < 0.135 and scale_change < 0.85 and distance < best_distance:
+                    best_track, best_distance = track_index, distance
+            item = {"box": detection, "sample": sample_index}
+            if best_track is None:
+                tracks.append({"items": [item], "representative_frame": frame.copy()})
+                assigned.add(len(tracks) - 1)
+            else:
+                tracks[best_track]["items"].append(item)
+                assigned.add(best_track)
 
-    if not ranked:
+    if not tracks:
         raise RuntimeError(
-            f"No face detections matched the requested {facecam_corner} facecam corner. "
-            "Use --facecam-corner auto or choose the corner containing the streamer."
+            "AI could not find a facecam face in the selected highlight. "
+            "The source may be too small/blurry, or the facecam may be hidden."
         )
 
-    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    best_score, best_count, best_corner, best = ranked[0]
-    min_observations = min(3, max(1, int(frame_count * 0.04)))
-    if best_count < min_observations:
-        raise RuntimeError("Face detections were too inconsistent to locate the streamer facecam reliably.")
-    if best_corner == "center":
-        log("  WARNING: No convincing corner facecam was found; using the best stable fallback face.")
-    log(f"  Facecam candidate: {best_corner}, observations={best_count}/{frame_count}, score={best_score:.3f}")
+    total_samples = max(1, valid_sample_count)
+    scored_tracks = []
+    for track in tracks:
+        items = track["items"]
+        if len(items) < max(2, int(np.ceil(total_samples * 0.12))):
+            continue
+        boxes = np.array([item["box"][:4] for item in items], dtype=np.float32)
+        centers = np.column_stack(((boxes[:, 0] + boxes[:, 2]) / 2, (boxes[:, 1] + boxes[:, 3]) / 2))
+        widths = boxes[:, 2] - boxes[:, 0]
+        heights = boxes[:, 3] - boxes[:, 1]
+        median_box = tuple(float(v) for v in np.median(boxes, axis=0))
+        center = np.median(centers, axis=0)
+        edge_distance = min(center[0] / width, 1.0 - center[0] / width,
+                            center[1] / height, 1.0 - center[1] / height)
+        area_ratio = float(np.median(widths * heights) / (width * height))
+        persistence = len(items) / total_samples
+        center_jitter = float(np.mean(np.linalg.norm((centers - center) / np.array([width, height]), axis=1)))
+        stable = float(np.exp(-center_jitter / 0.055))
+        edge_score = float(np.clip(1.0 - edge_distance / 0.36, 0.0, 1.0))
+        small_face_score = float(np.clip((0.025 - area_ratio) / 0.025, 0.0, 1.0))
+        confidence = float(np.mean([item["box"][4] for item in items]))
+        representative = track["representative_frame"]
+        frame_rect, border_score = _estimate_webcam_frame(representative, median_box)
+        score = (5.0 * persistence + 1.35 * edge_score + 1.05 * small_face_score
+                 + 0.9 * stable + 1.35 * border_score + 0.35 * confidence)
+        scored_tracks.append((score, track, median_box, frame_rect, persistence, edge_score, border_score))
 
-    face = tuple(int(round(median(item[i] for item in best))) for i in range(2, 6))
-    fx1, fy1, fx2, fy2 = face
-    face_w = max(2, fx2 - fx1)
-    face_h = max(2, fy2 - fy1)
-    face_cx = (fx1 + fx2) / 2.0
-    face_cy = (fy1 + fy2) / 2.0
+    if not scored_tracks:
+        raise RuntimeError(
+            "Face detections were too brief to track a webcam frame. "
+            "Try a longer highlight or lower --sample-interval."
+        )
 
-    # Expand from the face to capture the webcam panel, not just the face box.
-    # The 3:2 crop matches each 1080x720 panel of the 1080x1440 result.
-    cam_h = min(height * 0.58, width * 0.58 / 1.5, max(220.0, face_h * 3.5, face_w * 2.4))
-    cam_w = cam_h * 1.5
-    cam_x1 = int(round(np.clip(face_cx - cam_w / 2, 0, width - cam_w)))
-    cam_y1 = int(round(np.clip(face_cy - cam_h / 2, 0, height - cam_h)))
-    cam_rect = (cam_x1, cam_y1, cam_x1 + int(cam_w), cam_y1 + int(cam_h))
+    scored_tracks.sort(key=lambda entry: entry[0], reverse=True)
+    best = scored_tracks[0]
+    if best[0] < 3.0 or best[4] < 0.18:
+        raise RuntimeError(
+            "No reliable streamer webcam frame was found. Refusing to crop a random game character. "
+            "Try --sample-interval 0.4 or set --facecam-corner to the known webcam corner."
+        )
 
-    game_rect = choose_gameplay_crop(width, height, cam_rect)
-    return cam_rect, game_rect
-
+    face_rect = best[3]
+    game_rect = choose_gameplay_crop(width, height, face_rect)
+    log(
+        "  AI webcam detection: "
+        f"facecam={face_rect}, detections={len(best[1]['items'])}/{total_samples}, "
+        f"edge={best[5]:.2f}, frame-border={best[6]:.2f}, score={best[0]:.2f}"
+    )
+    return face_rect, game_rect
 
 def choose_gameplay_crop(
     width: int, height: int, avoid_rect: tuple[int, int, int, int]
 ) -> tuple[int, int, int, int]:
-    """Pick the largest useful gameplay crop without over-zooming to avoid the facecam.
-
-    The old implementation kept shrinking until it found a zero-overlap crop,
-    sometimes down to 42% of the original size. This version balances crop area
-    against overlap, so gameplay stays large and sharp even when the webcam is
-    baked into a corner of the source frame.
-    """
-    base_h = min(float(height), width / 1.5)
-    base_w = base_h * 1.5
+    """Find the largest 3:2 gameplay crop that avoids the detected webcam frame."""
     ax1, ay1, ax2, ay2 = avoid_rect
-    best_score = -1e9
-    best_rect = (0, 0, int(base_w), int(base_h))
-    base_area = max(1.0, base_w * base_h)
+    target_ratio = 1.5
+    if width / max(height, 1) >= target_ratio:
+        max_h = height
+        max_w = int(round(height * target_ratio))
+    else:
+        max_w = width
+        max_h = int(round(width / target_ratio))
+    max_area = float(max_w * max_h)
 
-    for scale in np.linspace(1.0, 0.72, 15):
-        cw = max(2, int(round(base_w * float(scale))))
-        ch = max(2, int(round(cw / 1.5)))
-        if ch > height:
-            ch = height
-            cw = int(ch * 1.5)
-        max_x = max(0, width - cw)
-        max_y = max(0, height - ch)
-        xs = set(int(round(x)) for x in np.linspace(0, max_x, 11))
-        ys = set(int(round(y)) for y in np.linspace(0, max_y, 11))
-        xs.update((int(np.clip(ax1 - cw, 0, max_x)), int(np.clip(ax2, 0, max_x))))
-        ys.update((int(np.clip(ay1 - ch, 0, max_y)), int(np.clip(ay2, 0, max_y))))
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    # Add exact clear-space sizes for the four sides of the webcam box. This
+    # avoids relying only on a coarse scale grid when the ideal width is, for
+    # example, exactly the space to the right of a bottom-left facecam.
+    scales = list(np.linspace(1.0, 0.56, 12))
+    clear_widths = (ax1, width - ax2)
+    clear_heights = (ay1, height - ay2)
+    scales.extend(min(max_w, max(0, clear_w)) / max_w for clear_w in clear_widths)
+    scales.extend(min(max_h, max(0, clear_h)) / max_h for clear_h in clear_heights)
+    scales = sorted({float(np.clip(scale, 0.56, 1.0)) for scale in scales}, reverse=True)
 
-        area = float(cw * ch)
-        area_fraction = area / base_area
+    # Permit a slightly smaller crop when that is what it takes to remove the
+    # webcam overlay completely. This is better than leaving a second tiny
+    # streamer window inside the gameplay panel.
+    for scale in scales:
+        crop_w = max(2, min(width, int(round(max_w * float(scale)))))
+        crop_h = max(2, min(height, int(round(crop_w / target_ratio))))
+        if crop_w / crop_h > target_ratio + 0.01:
+            crop_w = int(round(crop_h * target_ratio))
+        max_x = max(0, width - crop_w)
+        max_y = max(0, height - crop_h)
+        x_steps = min(25, max(2, max_x + 1))
+        y_steps = min(25, max(2, max_y + 1))
+        xs = set(int(x) for x in np.linspace(0, max_x, x_steps))
+        ys = set(int(y) for y in np.linspace(0, max_y, y_steps))
+        # Add exact alignment positions beside the webcam frame. A coarse grid
+        # alone could leave a thin strip of the overlay in the gameplay crop.
+        xs.update(int(np.clip(x, 0, max_x)) for x in (ax1 - crop_w, ax2))
+        ys.update(int(np.clip(y, 0, max_y)) for y in (ay1 - crop_h, ay2))
+        xs = sorted(xs)
+        ys = sorted(ys)
+        area_fraction = (crop_w * crop_h) / max_area
+        area_loss = 1.0 - area_fraction
+
         for x1 in xs:
             for y1 in ys:
-                x2, y2 = x1 + cw, y1 + ch
-                iw = max(0, min(x2, ax2) - max(x1, ax1))
-                ih = max(0, min(y2, ay2) - max(y1, ay1))
-                overlap_fraction = (iw * ih) / max(1.0, area)
-                center_dist = ((x1 + cw / 2 - width / 2) ** 2 + (y1 + ch / 2 - height / 2) ** 2) ** 0.5
-                center_penalty = 0.015 * (center_dist / max(1.0, (width ** 2 + height ** 2) ** 0.5))
-                # Penalize webcam overlap, but not enough to sacrifice most of the gameplay.
-                score = area_fraction * (1.0 - 2.0 * overlap_fraction) - center_penalty
-                if score > best_score:
-                    best_score = score
-                    best_rect = (x1, y1, x2, y2)
+                rect = (x1, y1, x1 + crop_w, y1 + crop_h)
+                ix = max(0, min(ax2, rect[2]) - max(ax1, rect[0]))
+                iy = max(0, min(ay2, rect[3]) - max(ay1, rect[1]))
+                overlap_fraction = (ix * iy) / float(crop_w * crop_h)
+                center_penalty = (
+                    abs((x1 + crop_w / 2) - width / 2) / max(width, 1)
+                    + abs((y1 + crop_h / 2) - height / 2) / max(height, 1)
+                )
+                score = 8.0 * overlap_fraction + 0.65 * area_loss + 0.015 * center_penalty
+                candidates.append((score, rect))
 
-    return best_rect
-
+    return min(candidates, key=lambda item: item[0])[1]
 
 def crop_rect(frame: np.ndarray, rect: tuple[int, int, int, int]) -> np.ndarray:
     x1, y1, x2, y2 = rect
@@ -388,7 +540,7 @@ def main() -> int:
         "--facecam-corner",
         choices=("auto", "top-left", "top-right", "bottom-left", "bottom-right"),
         default="auto",
-        help="Prefer the corner containing the streamer webcam; auto favors the usual lower corners.",
+        help="Auto-detect the streamer webcam frame; optionally restrict to a corner.",
     )
     parser.add_argument("--crf", type=int, default=17)
     parser.add_argument("--preset", default="slow")
@@ -431,10 +583,8 @@ def main() -> int:
             success += 1
             log(f"  Saved: {output}")
     finally:
-        try:
+        if detector is not None:
             detector.close()
-        except Exception:
-            pass
 
     if success == 0:
         raise RuntimeError("No selected clips were successfully split-rendered.")
