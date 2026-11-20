@@ -7,10 +7,6 @@ on:
         description: "Paste your YouTube video or completed livestream URL"
         required: true
         type: string
-      gemini_api_key:
-        description: "Gemini API key"
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -25,6 +21,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
+      GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
     steps:
       - name: Checkout repository
@@ -78,11 +75,10 @@ jobs:
       - name: Prepare secrets and YouTube cookies
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
-          GOOGLE_API_KEY: ${{ inputs.gemini_api_key }}
         run: |
           set -euo pipefail
           if [[ -z "${GOOGLE_API_KEY:-}" ]]; then
-            echo "::error::Gemini API key is missing."
+            echo "::error::Missing GEMINI_API_KEY repository secret. Add it once in Settings > Secrets and variables > Actions."
             exit 1
           fi
           echo "::add-mask::$GOOGLE_API_KEY"
@@ -96,7 +92,6 @@ jobs:
       - name: Download, find 2 highlights and render base clips
         env:
           VIDEO_URL: ${{ inputs.video_url }}
-          GOOGLE_API_KEY: ${{ inputs.gemini_api_key }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -127,7 +122,21 @@ jobs:
             --video-preset slow \
             --video-scale-algo lanczos
 
+      - name: Download only selected 4K facecam segments (when available)
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python tools/download_facecam_4k_segments.py \
+            --url "$VIDEO_URL" \
+            --manifest outputs/render_manifest.json \
+            --source video_asli.mp4 \
+            --cookies "$RUNNER_TEMP/youtube_cookies.txt" \
+            --output-dir "$RUNNER_TEMP/facecam_4k_segments"
+
       - name: Render facecam on top and gameplay below (1080x1440)
+        shell: bash
         run: |
           set -Eeuo pipefail
           test -s video_asli.mp4
@@ -138,7 +147,11 @@ jobs:
             --width 1080 \
             --height 1440 \
             --sample-interval 0.75 \
-            --facecam-sharpen 0.22 \
+            --facecam-sharpen 0.15 \
+            --facecam-trim-left 0.02 \
+            --facecam-trim-top 0.12 \
+            --facecam-trim-right 0.02 \
+            --facecam-trim-bottom 0.10 \
             --crf 17 \
             --preset slow
 
