@@ -633,8 +633,47 @@ def crop_rect(frame: np.ndarray, rect: tuple[int, int, int, int]) -> np.ndarray:
     return frame[y1:y2, x1:x2]
 
 
+def scale_rect_between_frames(
+    rect: tuple[int, int, int, int],
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> tuple[int, int, int, int]:
+    """Scale a rectangle between two renditions of the same stream."""
+    sx = target_width / max(1, source_width)
+    sy = target_height / max(1, source_height)
+    return _clamp_rect(
+        rect[0] * sx, rect[1] * sy, rect[2] * sx, rect[3] * sy,
+        target_width, target_height,
+    )
+
+
+def trim_facecam_rect(
+    rect: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    trim_left: float = 0.02,
+    trim_top: float = 0.12,
+    trim_right: float = 0.02,
+    trim_bottom: float = 0.10,
+) -> tuple[int, int, int, int]:
+    """Trim overlay UI/borders around the camera image, not the face itself."""
+    x1, y1, x2, y2 = rect
+    rw, rh = max(2, x2 - x1), max(2, y2 - y1)
+    return _clamp_rect(
+        x1 + rw * float(np.clip(trim_left, 0.0, 0.20)),
+        y1 + rh * float(np.clip(trim_top, 0.0, 0.20)),
+        x2 - rw * float(np.clip(trim_right, 0.0, 0.20)),
+        y2 - rh * float(np.clip(trim_bottom, 0.0, 0.20)),
+        width, height,
+    )
+
+
 def render_visual(
     source: Path,
+    facecam_source: Path,
+    facecam_start: float,
     silent_output: Path,
     start: float,
     end: float,
@@ -646,26 +685,102 @@ def render_visual(
     preset: str,
     facecam_sharpen: float,
     facecam_corner: str,
+    facecam_trim_left: float,
+    facecam_trim_top: float,
+    facecam_trim_right: float,
+    facecam_trim_bottom: float,
 ) -> float:
+    """Render high-resolution facecam above gameplay from the base source."""
     cap = cv2.VideoCapture(str(source))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open source video: {source}")
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     if not fps or fps < 1 or fps > 120:
         fps = 30.0
     source_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     source_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if source_w < 2 or source_h < 2:
+    if min(source_w, source_h) < 2:
         cap.release()
         raise RuntimeError("Source video has invalid dimensions.")
 
-    face_rect, game_rect = detect_facecam_region(
-        cap, detector, start, end, source_w, source_h, sample_interval, facecam_corner
+    same_facecam_source = (
+        facecam_source.resolve() == source.resolve()
+        and abs(facecam_start - start) < 0.001
     )
-    log(f"  Facecam crop: {face_rect}; gameplay crop: {game_rect}; source: {source_w}x{source_h}")
+    face_cap = cap if same_facecam_source else cv2.VideoCapture(str(facecam_source))
+    if not face_cap.isOpened():
+        if not same_facecam_source:
+            face_cap.release()
+        log("  WARNING: HQ facecam source could not be opened; falling back to video_asli.mp4.")
+        face_cap = cap
+        facecam_start = start
+        same_facecam_source = True
+
+    face_w = int(face_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    face_h = int(face_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    face_fps = face_cap.get(cv2.CAP_PROP_FPS)
+    if not face_fps or face_fps < 1 or face_fps > 120:
+        face_fps = fps
+    if min(face_w, face_h) < 2:
+        if not same_facecam_source:
+            face_cap.release()
+        cap.release()
+        raise RuntimeError("Facecam source has invalid dimensions.")
+
+    # Confirm that the optional high-resolution segment can actually decode.
+    # Unsupported video codecs or broken section files safely fall back to base.
+    if not same_facecam_source:
+        face_cap.set(cv2.CAP_PROP_POS_MSEC, facecam_start * 1000.0)
+        readable, _probe_frame = face_cap.read()
+        if not readable:
+            face_cap.release()
+            face_cap = cap
+            facecam_start = start
+            same_facecam_source = True
+            face_w, face_h, face_fps = source_w, source_h, fps
+            log("  WARNING: HQ facecam segment could not decode; falling back to video_asli.mp4.")
+
+    # The HQ file is either a short section (local timestamps) or the full
+    # source. The corresponding offset is recorded alongside each manifest item.
+    try:
+        face_rect_hq, _ = detect_facecam_region(
+            face_cap, detector, facecam_start, facecam_start + (end - start),
+            face_w, face_h, sample_interval, facecam_corner
+        )
+    except RuntimeError as exc:
+        if same_facecam_source:
+            if cap is not face_cap:
+                cap.release()
+            raise
+        log(f"  WARNING: HQ facecam detection failed ({exc}); retrying on base source.")
+        face_cap.release()
+        face_cap = cap
+        same_facecam_source = True
+        facecam_start = start
+        face_w, face_h, face_fps = source_w, source_h, fps
+        face_rect_hq, _ = detect_facecam_region(
+            cap, detector, start, end, source_w, source_h, sample_interval, facecam_corner
+        )
+    face_rect_hq_trimmed = trim_facecam_rect(
+        face_rect_hq, face_w, face_h,
+        facecam_trim_left, facecam_trim_top, facecam_trim_right, facecam_trim_bottom,
+    )
+    face_rect_base = scale_rect_between_frames(
+        face_rect_hq, face_w, face_h, source_w, source_h
+    )
+    game_rect = choose_gameplay_crop(source_w, source_h, face_rect_base)
+
+    log(
+        f"  Facecam source: {face_w}x{face_h} at {face_fps:.2f} fps; "
+        f"game source: {source_w}x{source_h} at {fps:.2f} fps"
+    )
+    log(
+        f"  Facecam frame (HQ): {face_rect_hq}; inner crop: {face_rect_hq_trimmed}; "
+        f"gameplay crop: {game_rect}"
+    )
 
     panel_h = height_out // 2
-    # Ensure an even output width/height for H.264.
     width_out -= width_out % 2
     panel_h -= panel_h % 2
     height_out = panel_h * 2
@@ -677,22 +792,59 @@ def render_visual(
         "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(silent_output),
     ]
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
 
     cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+    if not same_facecam_source:
+        face_cap.set(cv2.CAP_PROP_POS_MSEC, facecam_start * 1000.0)
     frame_count = 0
+    face_frame_index = 0
+    latest_face_frame = None
+    if not same_facecam_source:
+        ok_face, latest_face_frame = face_cap.read()
+        if not ok_face:
+            latest_face_frame = None
     duration = end - start
     try:
         while frame_count / fps < duration:
             ok, frame = cap.read()
-            if not ok:
+            if not ok or frame is None:
                 break
-            top = crop_rect(frame, face_rect)
+
+            if same_facecam_source:
+                face_frame = frame
+            else:
+                target_face_index = int(round(frame_count * face_fps / fps))
+                while latest_face_frame is not None and face_frame_index < target_face_index:
+                    ok_face, next_face_frame = face_cap.read()
+                    if not ok_face or next_face_frame is None:
+                        latest_face_frame = None
+                        break
+                    latest_face_frame = next_face_frame
+                    face_frame_index += 1
+                # If the HQ stream has a tiny duration mismatch, use the base
+                # source frame for the final few frames instead of aborting.
+                face_frame = latest_face_frame if latest_face_frame is not None else frame
+
+            if face_frame.shape[1] == face_w and face_frame.shape[0] == face_h:
+                top = crop_rect(face_frame, face_rect_hq_trimmed)
+            else:
+                top = crop_rect(frame, trim_facecam_rect(
+                    face_rect_base, source_w, source_h,
+                    facecam_trim_left, facecam_trim_top,
+                    facecam_trim_right, facecam_trim_bottom,
+                ))
             bottom = crop_rect(frame, game_rect)
+
+            # Lanczos gives a clean downsample from a 4K facecam crop. A little
+            # unsharp masking only compensates for encoder softness; it cannot
+            # invent camera detail that was not in the source stream.
             top = cv2.resize(top, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)
             bottom = cv2.resize(bottom, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)
             if facecam_sharpen > 0:
-                blurred = cv2.GaussianBlur(top, (0, 0), 1.0)
+                blurred = cv2.GaussianBlur(top, (0, 0), 0.8)
                 top = cv2.addWeighted(top, 1.0 + facecam_sharpen, blurred, -facecam_sharpen, 0)
             stacked = np.vstack((top, bottom))
             process.stdin.write(stacked.tobytes())
@@ -704,6 +856,8 @@ def render_visual(
         pass
     finally:
         cap.release()
+        if not same_facecam_source:
+            face_cap.release()
         if process.stdin:
             process.stdin.close()
 
@@ -713,7 +867,6 @@ def render_visual(
         raise RuntimeError(f"FFmpeg visual render failed (code {return_code}): {stderr[-3000:]}")
     log(f"  Rendered {frame_count} frames at {fps:.2f} fps.")
     return fps
-
 
 def mux_original_audio(
     source: Path, silent_video: Path, final_video: Path, start: float, duration: float
@@ -737,12 +890,22 @@ def resolve_video_path(value: str, root: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True, type=Path, help="Original downloaded stream video")
+    parser.add_argument("--source", required=True, type=Path, help="Original downloaded stream video for gameplay/audio")
+    parser.add_argument("--facecam-source", type=Path, default=None,
+                        help="Optional higher-resolution full-stream rendition used only for the facecam crop")
     parser.add_argument("--manifest", required=True, type=Path, help="outputs/render_manifest.json")
     parser.add_argument("--width", type=int, default=1080)
     parser.add_argument("--height", type=int, default=1440)
     parser.add_argument("--sample-interval", type=float, default=0.75)
-    parser.add_argument("--facecam-sharpen", type=float, default=0.22)
+    parser.add_argument("--facecam-sharpen", type=float, default=0.15)
+    parser.add_argument("--facecam-trim-left", type=float, default=0.02,
+                        help="Fraction to trim from the left edge of the detected webcam frame")
+    parser.add_argument("--facecam-trim-top", type=float, default=0.12,
+                        help="Fraction to trim from the top edge (removes HUD above the camera image)")
+    parser.add_argument("--facecam-trim-right", type=float, default=0.02,
+                        help="Fraction to trim from the right edge of the detected webcam frame")
+    parser.add_argument("--facecam-trim-bottom", type=float, default=0.10,
+                        help="Fraction to trim from the bottom edge (removes ticker/overlay below the camera)")
     parser.add_argument(
         "--facecam-corner",
         choices=("auto", "top-left", "top-right", "bottom-left", "bottom-right"),
@@ -755,9 +918,12 @@ def main() -> int:
     args = parser.parse_args()
 
     source = args.source.resolve()
+    facecam_source = args.facecam_source.resolve() if args.facecam_source else source
     manifest_path = args.manifest.resolve()
     if not source.is_file():
         raise RuntimeError(f"Original source video is missing: {source}")
+    if not facecam_source.is_file():
+        raise RuntimeError(f"High-quality facecam source is missing: {facecam_source}")
     if not manifest_path.is_file():
         raise RuntimeError(f"Render manifest is missing: {manifest_path}")
     if args.width <= 0 or args.height <= 0 or args.width * 4 != args.height * 3:
@@ -779,10 +945,22 @@ def main() -> int:
             silent = output.with_name(output.stem + ".split_visual.mp4")
             muxed = output.with_name(output.stem + ".split_mux.mp4")
             log(f"\n[{index}/{len(clips)}] Split-rendering highlight rank {clip.get('rank', index)} ({start:.2f}s–{end:.2f}s)")
+            clip_face_source = facecam_source
+            clip_face_start = start
+            if clip.get("facecam_source_path"):
+                clip_face_source = Path(str(clip["facecam_source_path"]))
+                if not clip_face_source.is_absolute():
+                    clip_face_source = (manifest_path.parent.parent / clip_face_source).resolve()
+                clip_face_start = float(clip.get("facecam_source_start", 0.0))
+                if not clip_face_source.is_file():
+                    log(f"  WARNING: HQ facecam segment missing: {clip_face_source}; using base source.")
+                    clip_face_source = facecam_source
+                    clip_face_start = start
             render_visual(
-                source, silent, start, end, args.width, args.height, detector,
+                source, clip_face_source, clip_face_start, silent, start, end, args.width, args.height, detector,
                 args.sample_interval, args.crf, args.preset, args.facecam_sharpen,
-                args.facecam_corner,
+                args.facecam_corner, args.facecam_trim_left, args.facecam_trim_top,
+                args.facecam_trim_right, args.facecam_trim_bottom,
             )
             mux_original_audio(source, silent, muxed, start, end - start)
             os.replace(muxed, output)
