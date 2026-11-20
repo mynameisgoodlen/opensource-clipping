@@ -67,16 +67,16 @@ def create_detector(model_path: Path):
 
 
 def _face_boxes(detector, frame: np.ndarray) -> list[tuple[float, float, float, float, float]]:
-    """Return face boxes and confidence, checking an enlarged copy for small insets."""
+    """Detect faces at native and enlarged scales so small webcam insets survive."""
     h, w = frame.shape[:2]
     detections: list[tuple[float, float, float, float, float]] = []
-    # The webcam is often much smaller than game characters. A second, enlarged
-    # pass improves detection of the inset without relying on its screen corner.
-    for scale in (1.0, min(1.6, 2560.0 / max(w, h))):
-        if scale <= 1.01:
-            candidate = frame
-        else:
-            candidate = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # Streamer webcams can be only ~50-90 px tall in a 1080p source. The old
+    # 1.33-1.6x cap missed those while finding much larger faces in the video.
+    upscale = min(2.0, 3200.0 / max(w, h))
+    for scale in sorted({1.0, upscale}):
+        candidate = frame if scale <= 1.01 else cv2.resize(
+            frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
         rgb = cv2.cvtColor(candidate, cv2.COLOR_BGR2RGB)
         result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
         for detection in result.detections or []:
@@ -119,49 +119,73 @@ def _clamp_rect(
     return x1, y1, x2, y2
 
 
-def _rect_border_score(frame: np.ndarray, rect: tuple[int, int, int, int], edges: np.ndarray | None = None) -> float:
-    """Measure whether a proposed webcam crop follows a visible inset-frame border."""
+def _rect_border_score(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    edges: np.ndarray | None = None,
+    color_mask: np.ndarray | None = None,
+) -> float:
+    """Score a real framed webcam inset using long edges and its colored border."""
     x1, y1, x2, y2 = rect
     h, w = frame.shape[:2]
     if x2 - x1 < 24 or y2 - y1 < 24:
         return 0.0
     if edges is None:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 55, 145)
-    band = max(2, min(7, int(round(min(x2 - x1, y2 - y1) * 0.025))))
-    inset = max(4, int(round(min(x2 - x1, y2 - y1) * 0.06)))
-    densities: list[float] = []
+        edges = cv2.Canny(gray, 45, 130)
+    if color_mask is None:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0]
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        color_mask = ((sat > 90) & (val > 65) & (
+            ((hue >= 78) & (hue <= 112)) | ((hue >= 120) & (hue <= 176))
+        )).astype(np.uint8)
+    band = max(3, min(8, int(round(min(x2 - x1, y2 - y1) * 0.025))))
+    inset = max(5, int(round(min(x2 - x1, y2 - y1) * 0.055)))
+    side_specs = []
+    if y1 > 2:
+        sl = (slice(max(0, y1 - band), min(h, y1 + band + 1)), slice(min(w, x1 + inset), max(0, x2 - inset)))
+        side_specs.append((edges[sl], color_mask[sl], 0))
+    if y2 < h - 2:
+        sl = (slice(max(0, y2 - band), min(h, y2 + band + 1)), slice(min(w, x1 + inset), max(0, x2 - inset)))
+        side_specs.append((edges[sl], color_mask[sl], 0))
+    if x1 > 2:
+        sl = (slice(min(h, y1 + inset), max(0, y2 - inset)), slice(max(0, x1 - band), min(w, x1 + band + 1)))
+        side_specs.append((edges[sl], color_mask[sl], 1))
+    if x2 < w - 2:
+        sl = (slice(min(h, y1 + inset), max(0, y2 - inset)), slice(max(0, x2 - band), min(w, x2 + band + 1)))
+        side_specs.append((edges[sl], color_mask[sl], 1))
 
-    # Ignore edges that coincide with the video boundary: the webcam box may
-    # deliberately touch the left/right/bottom edge of the livestream.
-    if y1 > 1:
-        roi = edges[max(0, y1 - band):min(h, y1 + band + 1), min(w, x1 + inset):max(0, x2 - inset)]
-        if roi.size:
-            densities.append(float(np.count_nonzero(roi)) / roi.size)
-    if y2 < h - 1:
-        roi = edges[max(0, y2 - band):min(h, y2 + band + 1), min(w, x1 + inset):max(0, x2 - inset)]
-        if roi.size:
-            densities.append(float(np.count_nonzero(roi)) / roi.size)
-    if x1 > 1:
-        roi = edges[min(h, y1 + inset):max(0, y2 - inset), max(0, x1 - band):min(w, x1 + band + 1)]
-        if roi.size:
-            densities.append(float(np.count_nonzero(roi)) / roi.size)
-    if x2 < w - 1:
-        roi = edges[min(h, y1 + inset):max(0, y2 - inset), max(0, x2 - band):min(w, x2 + band + 1)]
-        if roi.size:
-            densities.append(float(np.count_nonzero(roi)) / roi.size)
+    scores: list[float] = []
+    color_coverages: list[float] = []
+    for edge_roi, color_roi, axis in side_specs:
+        if edge_roi.size == 0 or color_roi.size == 0:
+            continue
+        edge_coverage = float(np.mean(np.any(edge_roi > 0, axis=axis)))
+        edge_density = float(np.mean(edge_roi > 0))
+        color_coverage = float(np.mean(np.any(color_roi > 0, axis=axis)))
+        color_coverages.append(color_coverage)
+        scores.append(0.45 * edge_coverage + 0.10 * float(np.clip(edge_density / 0.22, 0, 1))
+                      + 0.45 * color_coverage)
 
-    if not densities:
+    # The sample has a cyan/purple PiP outline. Requiring two colored sides
+    # prevents random game-scene edges from being mistaken for a webcam frame.
+    strong_colored_sides = sum(coverage >= 0.30 for coverage in color_coverages)
+    if len(scores) < 2 or strong_colored_sides < 2:
         return 0.0
-    # A clean border can have a high edge density, but cap the score so HUD
-    # text or busy gameplay edges cannot dominate face tracking.
-    return float(np.clip(np.mean(densities) / 0.20, 0.0, 1.0))
+    return float(np.clip(np.mean(scores), 0.0, 1.0))
 
 
 def _estimate_webcam_frame(
     frame: np.ndarray, face_box: tuple[float, float, float, float]
 ) -> tuple[tuple[int, int, int, int], float]:
-    """Expand a tracked face to the surrounding webcam frame, using border evidence."""
+    """Find a *small, bordered inset* around a face; never expand to the whole game.
+
+    The previous estimator allowed a detected gameplay face to expand to nearly
+    the entire frame. That is exactly how the wrong scene won. Here every
+    candidate must be webcam-sized and show strong border evidence.
+    """
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = face_box
     face_w = max(2.0, x2 - x1)
@@ -169,49 +193,93 @@ def _estimate_webcam_frame(
     center_x = (x1 + x2) / 2.0
     center_y = (y1 + y2) / 2.0
 
-    # A streamer face generally occupies roughly one-third of the webcam
-    # frame's height. Test several conventional overlay shapes and let visible
-    # border lines select the best fit. The 16:10 / 3x-height prior is only a
-    # fallback when the overlay has no visible border.
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    edge_map = cv2.Canny(gray, 55, 145)
+    edge_map = cv2.Canny(gray, 45, 130)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    color_mask = ((saturation > 90) & (value > 65) & (
+        ((hue >= 78) & (hue <= 112)) | ((hue >= 120) & (hue <= 176))
+    )).astype(np.uint8)
+    # Include 4:3-ish and near-square webcam frames as well as 16:9 overlays.
+    aspects = (1.15, 1.22, 1.33, 1.50, 1.70, 1.78, 1.91)
+    height_scales = (2.25, 2.75, 3.25, 3.55, 4.00, 4.35)
+    offsets = (-0.05, 0.0, 0.05)
+
     best_rect = None
     best_score = -1.0
-    for aspect in (1.50, 1.60, 1.78, 1.91):
-        for height_scale in (3.15, 3.30, 3.45, 3.60):
-            cam_h = max(face_h * height_scale, face_w * 2.65)
+    for aspect in aspects:
+        for height_scale in height_scales:
+            cam_h = face_h * height_scale
             cam_w = cam_h * aspect
-            for offset_x in (-0.06, 0.0, 0.06):
-                for offset_y in (-0.07, 0.0, 0.07):
+            # Hard size limits prevent a GTA character from expanding into the
+            # entire source frame. Overlays are usually a small fraction of it.
+            if cam_w < max(70.0, width * 0.075) or cam_h < max(55.0, height * 0.075):
+                continue
+            if cam_w > width * 0.48 or cam_h > height * 0.48:
+                continue
+            if cam_w < face_w * 2.0 or cam_h < face_h * 1.65:
+                continue
+            for offset_x in offsets:
+                for offset_y in offsets:
                     cx = center_x + cam_w * offset_x
                     cy = center_y + cam_h * offset_y
-                    rect = _clamp_rect(
-                        cx - cam_w / 2.0,
-                        cy - cam_h / 2.0,
-                        cx + cam_w / 2.0,
-                        cy + cam_h / 2.0,
-                        width,
-                        height,
-                    )
-                    actual_w = rect[2] - rect[0]
-                    actual_h = rect[3] - rect[1]
-                    if actual_w < face_w * 2.5 or actual_h < face_h * 2.2:
-                        continue
-                    border = _rect_border_score(frame, rect, edge_map)
-                    prior = np.exp(
-                        -abs(aspect - 1.60) * 1.6
-                        -abs(height_scale - 3.30) * 0.70
-                        -abs(offset_x) * 2.0
-                        -abs(offset_y) * 2.0
-                    )
-                    score = 1.30 * border + 0.70 * float(prior)
-                    if score > best_score:
-                        best_score = score
-                        best_rect = rect
+                    candidate_cx = [cx]
+                    candidate_cy = [cy]
+                    # Streamer overlays commonly attach to a screen edge. Add
+                    # edge-anchored hypotheses instead of centering every box
+                    # directly on the face (which cuts off the webcam room).
+                    if center_x <= cam_w * 0.78:
+                        candidate_cx.append(cam_w / 2.0)
+                    if width - center_x <= cam_w * 0.78:
+                        candidate_cx.append(width - cam_w / 2.0)
+                    if center_y <= cam_h * 0.78:
+                        candidate_cy.append(cam_h / 2.0)
+                    if height - center_y <= cam_h * 0.78:
+                        candidate_cy.append(height - cam_h / 2.0)
+                    for test_cx in set(candidate_cx):
+                      for test_cy in set(candidate_cy):
+                        raw_x1 = test_cx - cam_w / 2.0
+                        raw_y1 = test_cy - cam_h / 2.0
+                        raw_x2 = test_cx + cam_w / 2.0
+                        raw_y2 = test_cy + cam_h / 2.0
+                            # Only permit modest clipping where an overlay touches a
+                        # screen edge. Reject candidates that would be mostly offscreen.
+                        if raw_x1 < -cam_w * 0.30 or raw_x2 > width + cam_w * 0.30:
+                            continue
+                        if raw_y1 < -cam_h * 0.30 or raw_y2 > height + cam_h * 0.30:
+                            continue
+                        rect = _clamp_rect(raw_x1, raw_y1, raw_x2, raw_y2, width, height)
+                        rw, rh = rect[2] - rect[0], rect[3] - rect[1]
+                        if rw > width * 0.48 or rh > height * 0.48:
+                            continue
+                        # Face must sit comfortably inside the proposed inset.
+                        margin_x = min(center_x - rect[0], rect[2] - center_x)
+                        margin_y = min(center_y - rect[1], rect[3] - center_y)
+                        if margin_x < face_w * 0.75 or margin_y < face_h * 0.65:
+                            continue
 
+                        border = _rect_border_score(frame, rect, edge_map, color_mask)
+                        size_fraction = (rw * rh) / float(width * height)
+                        # Prefer a plausible PiP frame, not an enlarged crop of
+                        # whatever face happens to be in the main video.
+                        size_prior = float(np.clip(1.0 - abs(size_fraction - 0.065) / 0.12, 0.0, 1.0))
+                        aspect_prior = float(np.exp(-abs(aspect - 1.45) * 0.75))
+                        scale_prior = float(np.exp(-abs(height_scale - 3.80) * 0.22))
+                        edge_anchor = 0.20 if min(rect[0], rect[1], width - rect[2], height - rect[3]) <= 2 else 0.0
+                        score = (5.0 * border + 0.50 * size_prior + 0.10 * aspect_prior
+                                 + 0.45 * scale_prior + edge_anchor)
+                        if score > best_score:
+                            best_score = score
+                            best_rect = rect
     if best_rect is None:
-        raise RuntimeError("Could not estimate the webcam frame around the detected face.")
-    return best_rect, max(0.0, best_score)
+        raise RuntimeError("No webcam-sized frame could be estimated around this face.")
+    border_score = _rect_border_score(frame, best_rect, edge_map, color_mask)
+    if border_score < 0.20:
+        raise RuntimeError(
+            "The detected face is not inside a clearly bordered webcam inset. "
+            "Refusing to treat gameplay faces as the streamer."
+        )
+    return best_rect, border_score
 
 
 def detect_facecam_region(
@@ -226,9 +294,9 @@ def detect_facecam_region(
 ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
     """Find the streamer inset by tracking persistent faces and locating its frame.
 
-    The game may contain many faces. The webcam candidate is selected using
-    temporal position/size consistency, small face scale, screen-edge location,
-    and evidence of a rectangular inset border. No corner is assumed.
+    The game may contain many faces. Candidates are kept only when a small face
+    can be expanded into a webcam-sized rectangle with visible border evidence.
+    Large gameplay faces are rejected instead of being allowed to fill the crop.
     """
     corners = ("top-left", "top-right", "bottom-left", "bottom-right")
     if facecam_corner not in ("auto", *corners):
@@ -256,7 +324,13 @@ def detect_facecam_region(
             fw, fh = x2 - x1, y2 - y1
             area_ratio = (fw * fh) / float(width * height)
             aspect = fw / max(fh, 1.0)
-            if fw < 18 or fh < 18 or area_ratio > 0.085 or not 0.52 <= aspect <= 1.65:
+            # The streamer is a small face inside a picture-in-picture frame.
+            # Reject large close-up faces from the watched video/game.
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            edge_distance = min(cx / width, 1.0 - cx / width, cy / height, 1.0 - cy / height)
+            if fw < 16 or fh < 16 or area_ratio > 0.022 or not 0.48 <= aspect <= 1.75:
+                continue
+            if edge_distance > 0.23:
                 continue
             if facecam_corner != "auto":
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
@@ -321,13 +395,21 @@ def detect_facecam_region(
         persistence = len(items) / total_samples
         center_jitter = float(np.mean(np.linalg.norm((centers - center) / np.array([width, height]), axis=1)))
         stable = float(np.exp(-center_jitter / 0.055))
-        edge_score = float(np.clip(1.0 - edge_distance / 0.36, 0.0, 1.0))
-        small_face_score = float(np.clip((0.025 - area_ratio) / 0.025, 0.0, 1.0))
+        edge_score = float(np.clip(1.0 - edge_distance / 0.24, 0.0, 1.0))
+        small_face_score = float(np.clip((0.018 - area_ratio) / 0.018, 0.0, 1.0))
         confidence = float(np.mean([item["box"][4] for item in items]))
         representative = track["representative_frame"]
-        frame_rect, border_score = _estimate_webcam_frame(representative, median_box)
-        score = (5.0 * persistence + 1.35 * edge_score + 1.05 * small_face_score
-                 + 0.9 * stable + 1.35 * border_score + 0.35 * confidence)
+        try:
+            frame_rect, border_score = _estimate_webcam_frame(representative, median_box)
+        except RuntimeError:
+            continue
+        frame_area_ratio = ((frame_rect[2] - frame_rect[0]) * (frame_rect[3] - frame_rect[1])) / float(width * height)
+        if frame_area_ratio > 0.18:
+            continue
+        # Border evidence is mandatory and receives more weight than
+        # persistence, because gameplay characters can stay on screen too.
+        score = (2.0 * persistence + 2.0 * edge_score + 1.4 * small_face_score
+                 + 0.7 * stable + 3.8 * border_score + 0.25 * confidence)
         scored_tracks.append((score, track, median_box, frame_rect, persistence, edge_score, border_score))
 
     if not scored_tracks:
@@ -338,10 +420,10 @@ def detect_facecam_region(
 
     scored_tracks.sort(key=lambda entry: entry[0], reverse=True)
     best = scored_tracks[0]
-    if best[0] < 3.0 or best[4] < 0.18:
+    if best[0] < 4.0 or best[4] < 0.10 or best[6] < 0.20:
         raise RuntimeError(
-            "No reliable streamer webcam frame was found. Refusing to crop a random game character. "
-            "Try --sample-interval 0.4 or set --facecam-corner to the known webcam corner."
+            "No reliable bordered streamer webcam was found. Refusing to crop a random game character. "
+            "The facecam may be too small or its frame border may not be visible."
         )
 
     face_rect = best[3]
