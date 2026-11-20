@@ -89,22 +89,15 @@ jobs:
           python -m pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
           yt-dlp --version
 
-      - name: Prepare secrets and YouTube cookies
-        env:
-          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+      - name: Validate Gemini secret
+        shell: bash
         run: |
           set -euo pipefail
           if [[ -z "${GOOGLE_API_KEY:-}" ]]; then
-            echo "::error::Missing GEMINI_API_KEY repository secret. Add it once in Settings > Secrets and variables > Actions."
+            echo "::error::Missing GEMINI_API_KEY repository secret."
             exit 1
           fi
           echo "::add-mask::$GOOGLE_API_KEY"
-          if [[ -z "${YOUTUBE_COOKIES:-}" ]]; then
-            echo "::error::Missing YOUTUBE_COOKIES repository secret. Add the full Netscape-format cookies.txt contents."
-            exit 1
-          fi
-          printf '%s' "$YOUTUBE_COOKIES" > "$RUNNER_TEMP/youtube_cookies.txt"
-          chmod 600 "$RUNNER_TEMP/youtube_cookies.txt"
 
       - name: Download, find 2 highlights and render base clips
         env:
@@ -196,6 +189,3 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-      - name: Remove temporary cookies
-        if: ${{ always() }}
-        run: rm -f "$RUNNER_TEMP/youtube_cookies.txt"
