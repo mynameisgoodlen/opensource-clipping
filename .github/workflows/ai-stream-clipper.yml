@@ -27,19 +27,36 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Remove forced legacy YouTube player clients
+      - name: Configure YouTube player client fallback
+        shell: bash
         run: |
+          set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+
           path = Path("clipping/engine.py")
           source = path.read_text(encoding="utf-8")
-          forced =             "extractor_args": {"youtube": ["player_client=default,-web_embedded"]},
-"force_ipv4": True,
-              path.write_text(source.replace(forced, "", 1), encoding="utf-8")
-              print("Removed forced android,web YouTube player clients; yt-dlp will choose defaults.")
+
+          old = '            "extractor_args": {"youtube": ["player_client=android,web"]},\n'
+
+          new = (
+              '            "extractor_args": {"youtube": ["player_client=default,-web_embedded"]},\n'
+              '            "force_ipv4": True,\n'
+          )
+
+          if old in source:
+              source = source.replace(old, new, 1)
+              path.write_text(source, encoding="utf-8")
+              print("Updated YouTube player client settings.")
+          elif new in source:
+              print("YouTube fallback settings are already installed.")
           else:
-              print("No matching legacy player-client override found; leaving engine.py unchanged.")
+              raise SystemExit(
+                  "ERROR: Could not find the expected YouTube settings in clipping/engine.py"
+              )
           PY
+
+          python -m py_compile clipping/engine.py
 
       - name: Set up Python
         uses: actions/setup-python@v7
