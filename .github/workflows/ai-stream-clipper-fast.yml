@@ -1,0 +1,427 @@
+name: AI Stream Clipper - 4K Facecam + Gameplay
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Paste your YouTube video or completed livestream URL"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clip:
+    name: Find 2 highlights and render 1080x1440 facecam/gameplay clips
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install FFmpeg and system libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 libsm6 libxext6
+          ffmpeg -version
+          ffprobe -version
+          deno --version
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+          python -m pip install --no-cache-dir \
+            "numpy==1.26.4" \
+            "mediapipe==0.10.21" \
+            "opencv-contrib-python==4.11.0.86" \
+            Pillow requests python-dotenv faster-whisper google-genai tqdm
+
+      - name: Download and validate lightweight FSRCNN model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p weights
+          if ! curl --fail --location --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x4.pb" \
+            --output weights/FSRCNN_x4.pb; then
+            echo "::warning::FSRCNN download failed; renderer will use the fast Lanczos fallback."
+            rm -f weights/FSRCNN_x4.pb
+          fi
+          if [[ -s weights/FSRCNN_x4.pb ]]; then
+            python - <<'PY'
+          import cv2
+          import numpy as np
+          if not hasattr(cv2, "dnn_superres"):
+              raise SystemExit("cv2.dnn_superres is missing; opencv-contrib-python was not installed.")
+          sr = cv2.dnn_superres.DnnSuperResImpl_create()
+          sr.readModel("weights/FSRCNN_x4.pb")
+          sr.setModel("fsrcnn", 4)
+          out = sr.upsample(np.zeros((48, 48, 3), dtype=np.uint8))
+          if out.shape[:2] != (192, 192):
+              raise SystemExit(f"Unexpected FSRCNN x4 output: {out.shape}")
+          print("FSRCNN x4 model validated:", out.shape)
+          PY
+          else
+            echo "FSRCNN model unavailable; Lanczos fallback remains enabled."
+          fi
+
+      - name: Patch renderer for fast FSRCNN x4 (no per-frame ESRGAN)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/streamer_gameplay_split.py")
+          source = path.read_text(encoding="utf-8")
+          marker = "FAST_FSRCNN_RENDERER_V1 = True"
+
+          def replace_once(old, new, label):
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"Cannot patch {label}: expected one match, found {count}.")
+              source = source.replace(old, new, 1)
+
+          if marker not in source:
+              replace_once(
+                  "import subprocess\nimport sys\nimport urllib.request\n",
+                  "import subprocess\nimport sys\nimport time\nimport urllib.request\n",
+                  "time import",
+              )
+              replace_once(
+                  'MODEL_PATH = Path("blaze_face_short_range_v1.tflite")\n',
+                  'MODEL_PATH = Path("blaze_face_short_range_v1.tflite")\nFAST_FSRCNN_RENDERER_V1 = True\n',
+                  "renderer marker",
+              )
+              helper = (
+                  "def create_fsrcnn_upscaler(model_path: Path):\n"
+                  "    if not model_path.is_file():\n"
+                  "        raise FileNotFoundError(f\"FSRCNN model file is missing: {model_path}\")\n"
+                  "    if not hasattr(cv2, \"dnn_superres\"):\n"
+                  "        raise RuntimeError(\"cv2.dnn_superres is unavailable; install opencv-contrib-python.\")\n"
+                  "    sr = cv2.dnn_superres.DnnSuperResImpl_create()\n"
+                  "    sr.readModel(str(model_path))\n"
+                  "    sr.setModel(\"fsrcnn\", 4)\n"
+                  "    sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)\n"
+                  "    sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)\n"
+                  "    return sr\n\n\n"
+                  "def scale_rect_between_frames(\n"
+              )
+              replace_once("def scale_rect_between_frames(\n", helper, "FSRCNN loader")
+              replace_once(
+                  "    facecam_trim_bottom: float,\n) -> float:\n    \"\"\"Render high-resolution facecam above gameplay from the base source.\"\"\"\n",
+                  "    facecam_trim_bottom: float,\n    sr_model_path: Path,\n) -> float:\n    \"\"\"Render high-resolution facecam above gameplay from the base source.\"\"\"\n",
+                  "renderer signature",
+              )
+              old_init = (
+                  '    log(\n'
+                  '        f"  Facecam frame (HQ): {face_rect_hq}; inner crop: {face_rect_hq_trimmed}; "\n'
+                  '        f"gameplay crop: {game_rect}"\n'
+                  '    )\n\n'
+                  '    panel_h = height_out // 2\n'
+              )
+              new_init = (
+                  '    log(\n'
+                  '        f"  Facecam frame (HQ): {face_rect_hq}; inner crop: {face_rect_hq_trimmed}; "\n'
+                  '        f"gameplay crop: {game_rect}"\n'
+                  '    )\n\n'
+                  '    facecam_sr = None\n'
+                  '    if face_h >= 2160:\n'
+                  '        log("  Facecam quality path: native 4K+ source; AI upscaling skipped.")\n'
+                  '    else:\n'
+                  '        try:\n'
+                  '            facecam_sr = create_fsrcnn_upscaler(sr_model_path)\n'
+                  '            log("  Facecam quality path: lightweight FSRCNN x4 (CPU).")\n'
+                  '        except Exception as exc:\n'
+                  '            log(f"  WARNING: FSRCNN unavailable; using Lanczos fallback: {exc}")\n'
+                  '    sr_frames = 0\n'
+                  '    sr_elapsed_total = 0.0\n\n'
+                  '    panel_h = height_out // 2\n'
+              )
+              replace_once(old_init, new_init, "FSRCNN initialization")
+              old_resize = (
+                  '            # Lanczos gives a clean downsample from a 4K facecam crop. A little\n'
+                  '            # unsharp masking only compensates for encoder softness; it cannot\n'
+                  '            # invent camera detail that was not in the source stream.\n'
+                  '            top = cv2.resize(top, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)\n'
+                  '            bottom = cv2.resize(bottom, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)\n'
+              )
+              new_resize = (
+                  '            if facecam_sr is not None:\n'
+                  '                try:\n'
+                  '                    sr_started = time.perf_counter()\n'
+                  '                    enhanced_top = facecam_sr.upsample(top)\n'
+                  '                    sr_elapsed_total += time.perf_counter() - sr_started\n'
+                  '                    sr_frames += 1\n'
+                  '                    top = cv2.resize(enhanced_top, (width_out, panel_h), interpolation=cv2.INTER_AREA)\n'
+                  '                    if sr_frames == 60:\n'
+                  '                        average_ms = sr_elapsed_total / sr_frames * 1000.0\n'
+                  '                        log(f"  FSRCNN speed check: {average_ms:.1f} ms/frame.")\n'
+                  '                        if average_ms > 100.0:\n'
+                  '                            facecam_sr = None\n'
+                  '                            log("  WARNING: FSRCNN too slow on this runner; disabling it and continuing with Lanczos.")\n'
+                  '                except Exception as exc:\n'
+                  '                    facecam_sr = None\n'
+                  '                    log(f"  WARNING: FSRCNN failed; continuing with Lanczos: {exc}")\n'
+                  '                    top = cv2.resize(top, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)\n'
+                  '            else:\n'
+                  '                top = cv2.resize(top, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)\n'
+                  '            bottom = cv2.resize(bottom, (width_out, panel_h), interpolation=cv2.INTER_LANCZOS4)\n'
+              )
+              replace_once(old_resize, new_resize, "per-frame FSRCNN")
+              replace_once(
+                  '    log(f"  Rendered {frame_count} frames at {fps:.2f} fps.")\n    return fps\n',
+                  '    if sr_frames:\n'
+                  '        log(f"  FSRCNN processed {sr_frames} frames; average inference {sr_elapsed_total / sr_frames * 1000.0:.1f} ms/frame.")\n'
+                  '    log(f"  Rendered {frame_count} frames at {fps:.2f} fps.")\n    return fps\n',
+                  "FSRCNN summary",
+              )
+              replace_once(
+                  '    parser.add_argument("--model", type=Path, default=MODEL_PATH)\n',
+                  '    parser.add_argument("--model", type=Path, default=MODEL_PATH)\n'
+                  '    parser.add_argument("--sr-model", type=Path, default=Path("weights/FSRCNN_x4.pb"))\n',
+                  "SR CLI",
+              )
+              replace_once(
+                  '                args.facecam_trim_right, args.facecam_trim_bottom,\n            )\n',
+                  '                args.facecam_trim_right, args.facecam_trim_bottom, args.sr_model,\n            )\n',
+                  "pass SR model",
+              )
+              path.write_text(source, encoding="utf-8")
+              print("Installed lightweight FSRCNN x4 renderer patch.")
+          else:
+              print("Fast FSRCNN renderer patch already installed.")
+          PY
+          python -m py_compile tools/streamer_gameplay_split.py
+
+      - name: Update yt-dlp
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir --upgrade --pre "yt-dlp[default]"
+          yt-dlp --version
+
+      - name: Configure YouTube player client for main and 4K downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          engine_path = Path("clipping/engine.py")
+          engine = engine_path.read_text(encoding="utf-8")
+          old_engine = '            "extractor_args": {"youtube": ["player_client=android,web"]},\n'
+          new_engine = (
+              '            "extractor_args": {"youtube": ["player_client=default,-web_embedded"]},\n'
+              '            "force_ipv4": True,\n'
+          )
+
+          if old_engine in engine:
+              engine = engine.replace(old_engine, new_engine, 1)
+              engine_path.write_text(engine, encoding="utf-8")
+              print("Configured the main YouTube downloader.")
+          elif '"player_client=default,-web_embedded"' in engine and '"force_ipv4": True' in engine:
+              print("Main YouTube downloader is already configured.")
+          else:
+              raise SystemExit("Could not safely find the expected YouTube settings in clipping/engine.py")
+
+          facecam_path = Path("tools/download_facecam_4k_segments.py")
+          facecam = facecam_path.read_text(encoding="utf-8")
+          old_facecam = '            "--remote-components", "ejs:github",\n'
+          new_facecam = (
+              old_facecam
+              + '            "--extractor-args", "youtube:player_client=default,-web_embedded",\n'
+              + '            "--force-ipv4",\n'
+          )
+
+          if old_facecam in facecam and '"--extractor-args", "youtube:player_client=default,-web_embedded"' not in facecam:
+              facecam = facecam.replace(old_facecam, new_facecam, 1)
+              facecam_path.write_text(facecam, encoding="utf-8")
+              print("Configured the 4K facecam segment downloader.")
+          elif '"--extractor-args", "youtube:player_client=default,-web_embedded"' in facecam:
+              print("4K facecam downloader is already configured.")
+          else:
+              raise SystemExit("Could not safely configure tools/download_facecam_4k_segments.py")
+          PY
+          python -m py_compile clipping/engine.py tools/download_facecam_4k_segments.py
+
+      - name: Validate Gemini secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GOOGLE_API_KEY:-}" ]]; then
+            echo "::error::Missing GEMINI_API_KEY repository secret."
+            exit 1
+          fi
+          echo "::add-mask::$GOOGLE_API_KEY"
+
+      - name: Prepare and validate YouTube cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          raw = os.environ.get("YOUTUBE_COOKIES", "")
+          if not raw.strip():
+              raise SystemExit(
+                  "Missing YOUTUBE_COOKIES repository secret. Add your signed-in YouTube cookies.txt "
+                  "in Netscape format to GitHub Actions secrets."
+              )
+
+          cookie_path = Path(os.environ["RUNNER_TEMP"]) / "youtube_cookies.txt"
+          cookie_path.write_text(raw.rstrip() + "\n", encoding="utf-8")
+          cookie_path.chmod(0o600)
+
+          youtube_rows = [
+              line for line in raw.splitlines()
+              if len(line.split("\t")) >= 7 and "youtube.com" in line.split("\t", 1)[0].lower()
+          ]
+          if not youtube_rows:
+              cookie_path.unlink(missing_ok=True)
+              raise SystemExit(
+                  "YOUTUBE_COOKIES is not a Netscape cookies.txt file or contains no youtube.com entries. "
+                  "Export cookies while signed in to YouTube."
+              )
+
+          print(f"Validated Netscape cookies file ({len(youtube_rows)} YouTube cookie entries).")
+          PY
+
+      - name: Download, find 2 highlights and render base clips
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${VIDEO_URL//[[:space:]]/}" ]]; then
+            echo "::error::YouTube URL is missing."
+            exit 1
+          fi
+
+          test -s "$RUNNER_TEMP/youtube_cookies.txt"
+          mkdir -p outputs
+
+          python main.py \
+            --url "$VIDEO_URL" \
+            --source youtube \
+            --yt-cookies "$RUNNER_TEMP/youtube_cookies.txt" \
+            --clips 2 \
+            --ratio "3:4" \
+            --source-height max \
+            --render-height 1080 \
+            --ai-provider gemini \
+            --whisper-model base \
+            --whisper-device cpu \
+            --whisper-compute-type int8 \
+            --face-detector mediapipe \
+            --no-subs \
+            --no-karaoke \
+            --no-broll \
+            --no-bgm \
+            --no-hook \
+            --no-segment-trim \
+            --video-crf 17 \
+            --video-preset medium \
+            --video-scale-algo lanczos
+
+          test -s video_asli.mp4
+          test -s outputs/render_manifest.json
+
+      - name: Download selected 4K facecam segments when available
+        timeout-minutes: 20
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if python tools/download_facecam_4k_segments.py \
+            --url "$VIDEO_URL" \
+            --manifest outputs/render_manifest.json \
+            --source video_asli.mp4 \
+            --cookies "$RUNNER_TEMP/youtube_cookies.txt" \
+            --output-dir "$RUNNER_TEMP/facecam_4k_segments"; then
+            echo "4K facecam segment step completed."
+          else
+            echo "::warning::The separate 4K facecam download failed. The renderer will use the highest-quality full source instead."
+          fi
+
+      - name: Render facecam on top and gameplay below (1080x1440)
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -s video_asli.mp4
+          test -s outputs/render_manifest.json
+
+          python tools/streamer_gameplay_split.py \
+            --source video_asli.mp4 \
+            --manifest outputs/render_manifest.json \
+            --width 1080 \
+            --height 1440 \
+            --sample-interval 0.75 \
+            --facecam-sharpen 0.22 \
+            --sr-model weights/FSRCNN_x4.pb \
+            --facecam-trim-left 0.02 \
+            --facecam-trim-top 0.12 \
+            --facecam-trim-right 0.02 \
+            --facecam-trim-bottom 0.10 \
+            --crf 15 \
+            --preset medium
+
+      - name: Check generated clips
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p outputs
+          count=$(find outputs -type f -name 'highlight_rank_*_ready.mp4' | wc -l)
+          echo "Generated final facecam/gameplay clips: $count"
+          if [[ "$count" -lt 1 ]]; then
+            echo "::error::No final MP4 clips were generated."
+            find outputs -maxdepth 5 -type f -print || true
+            exit 1
+          fi
+          find outputs -type f -name 'highlight_rank_*_ready.mp4' -exec ls -lh {} \;
+
+      - name: Upload final clips
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: facecam-gameplay-clips-1080x1440
+          path: outputs/**/highlight_rank_*_ready.mp4
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Remove temporary YouTube cookies
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/youtube_cookies.txt"
